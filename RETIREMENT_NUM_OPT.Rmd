@@ -1,0 +1,1748 @@
+---
+title: "CMA-ES Glide Path Optimizer"
+author: "Thomas Benacci"
+date: "2025-04-18"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 8
+---
+
+```{r}
+# replace with actual path to mc_mortality_input.rds
+mortality_path <- "F:/PredictingMortality/mc_mortality_input.rds"
+```
+
+# Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 8, cache = FALSE)
+library(tidyverse)
+library(scales)
+library(MASS)
+library(lhs)
+library(parallel)
+```
+
+# Motivation
+
+The conventional wisdom for retirement investing is to shift out of equities and into bonds as one gets older, locking in gains and reducing exposure to downside risk. The standard target-date fund answer is a glide path that slopes downward from high equity to low equity over ones lifetime. That is a fine heuristic, but it is only one shape among many. What if it were actually better, under certain mortality, spending, market, and economic assumptions, to re-balance back into equities at some point later in life? Could it be that in order to minimize the probability of ruin, it is necessary to re-allocate a portfolio subject to withdrawals back into riskier assets with higher long term returns that fixed income assets?
+
+Pfau and Kitces (2014) explored the issue of what makes an appropriate equity glide path for client portfolios during retirement. They found that an equity glide path that starts conservative in retirement and becomes more aggressive at time passes in retirement has the potential to reduce the probability of failure and the magnitude of any failures. They conclude that the traditional argument that equity exposure should decrease throughout retirement as a retiree’s time horizon and life expectancy shrinks and mortality looms ignores conditions that may negatively impact a portfolio's ability to sustain desired withdrawal rates. Namely, conditions that may ruin a retirement portfolio are prolonged periods of poor returns leading into retirement. Dollar-cost-averaging into a higher equity allocation amidst sideways or poor equity markets as retirement commences will "maximize exposure by the time the good returns show up." 
+
+In Pfau and Kitces (2014) chosen methodology, 121 lifetime asset allocation glide paths were modeled. However, to discover a near-optimal solution to minimize portfolio ruin (P(ruin)) without relying on picking from a static set, I propose a numerical portfolio allocation optimization over a Monte Carlo simulation of market and economic variables. In this framework, P(ruin)'s sensitivity to changing variables and parameters can be observed, a solution to a precisely defined input variable set may be found, and variables may be readily incorporated to improve realism. Under a reasonably realistic model, we will observe whether Pfau and Kitces proposition maintains its validity. 
+
+This notebook discovers near-optimal lifetime allocation glide paths across all asset classes simultaneously by minimizing P(ruin), using Covariance Matrix Adaptation Evolution Strategy (CMA-ES) operating on Bernstein polynomial control points. Each asset class gets its own independent Bernstein curve with N_CPTS = 20 control points. The optimizer is free to find any smooth shape for each asset and the answer it converges on reflects the real trade-off between safety and growth given a specific set of mortality, income, spending, and bequest assumptions.
+
+# Bernstein Polynomials
+
+A Bernstein polynomial is a way of expressing a curve as a weighted blend of basis functions. Given n control points b_0, b_1, ..., b_{n-1}, each in [0,1], the degree (n-1) Bernstein polynomial evaluated at a parameter tau in [0,1] is:
+
+$$w(\tau) = \sum_{k=0}^{n-1} \binom{n-1}{k} \tau^k (1-\tau)^{n-1-k} \cdot b_k$$
+
+At each value of tau (which we map to age), the curve is a weighted average of the control points, where the weights come from the binomial distribution. Early in retirement-planning life (tau near 0), the curve is dominated by the first few control points. Late in life (tau near 1), the last few control points dominate. In between, the influence blends smoothly.
+
+Several properties make Bernstein polynomials ideal for glide path optimization. First, smoothness is structural. The curve is infinitely differentiable by construction, so there is no way to produce a jagged or discontinuous allocation path no matter what values the control points take. This means we never need a roughness penalty in the objective function because the parameterization itself rules out bad shapes. Jagged glide paths was a problem in an earlier rendition of this program when a naive Monte Carlo sampling approach was employed over the optimization space. Second, the convex hull property guarantees that the curve always lies within the convex hull of its control points. Since we constrain each control point to [0,1], the resulting raw values are automatically in [0,1] at every age with no clamping or projection needed. Third, the search space is low-dimensional. Instead of optimizing one free weight per year of life per asset class, we optimize only N_CPTS control points per asset, which dramatically improves convergence speed and solution quality for any black-box optimizer. Fourth, despite the smoothness guarantee, the polynomials are not restricted to any particular shape. Declining, rising, V-shaped, S-shaped, and flat paths are all possible The basis enforces smoothness, not monotonicity. Fifth, evaluation is cheap and direct: the k-th basis function of degree n evaluated at tau is exactly `dbinom(k, n, tau)` in R, and because the basis depends only on the shape parameters and not on the control-point values, we pre-compute the full basis matrix once at program start.
+
+# CMA-ES
+
+CMA-ES (Covariance Matrix Adaptation Evolution Strategy) is a derivative-free optimization algorithm designed for continuous, non-convex, and potentially noisy objective functions. It belongs to the family of evolutionary strategies, but it is much more sophisticated than a simple genetic algorithm.
+
+Each generation, CMA-ES samples a population of candidate solutions (lambda) from a multivariate normal distribution centered on the current best estimate of the optimum. The candidates are evaluated on the objective function, ranked, and the best half (called mu) are used to update the distribution for the next generation.
+
+The defining feature of CMA-ES is that it maintains and adapts a covariance matrix that describes the shape of its search distribution. Over time, the algorithm learns which directions in the search space are promising and stretches the sampling distribution along those directions. This is loosely analogous to learning a local approximation of the inverse Hessian, but without ever computing a gradient.
+
+Separately from the covariance matrix, CMA-ES maintains a global step size (sigma) that controls the overall scale of the search. Sigma is adapted using a mechanism called cumulative step-size adaptation (CSA), which tracks whether consecutive steps are correlated (sigma is too small) or uncorrelated (sigma is too large). When the algorithm converges, sigma collapses toward zero.
+
+In this notebook we use the separable variant, sep-CMA-ES, which maintains only the diagonal of the covariance matrix rather than the full matrix. This reduces the per-generation cost from O(n^2) to O(n), which matters when running tens of thousands of Monte Carlo simulations per fitness evaluation. The trade-off is that sep-CMA-ES cannot learn correlations between dimensions, but for Bernstein control points (which are relatively independent) this is an acceptable simplification.
+
+The mu best candidates are not averaged equally. Instead, CMA-ES uses log-weighted recombination: the best candidate gets the most weight, the second-best gets less, and so on. The effective number of parents (mu_eff) summarizes how concentrated the weighting is. This accelerates convergence compared to equal-weight averaging.
+
+The overall loop each generation is: sample candidates from the current distribution, evaluate fitness in parallel, rank by fitness, update the mean (weighted average of best candidates), update the evolution paths, adapt the covariance matrix diagonal, and adapt sigma. The algorithm terminates when sigma collapses below a threshold, when the best fitness stalls for a specified number of generations, or when the maximum number of generations is reached.
+
+
+# Asset Class Params
+
+We model four asset classes with nominal return parameters. Historical calibrations such as Ibbotson (1927-2006) report real (inflation-adjusted) returns, so we start there and add a long-run expected inflation equal to the CIR long-run mean (`cir_theta = 3.5%`) to each asset's arithmetic mean to convert to nominal. Returns are drawn from a multivariate lognormal distribution: log(1+R) ~ N(mu, Sigma). The log-space mean is derived from the arithmetic mean and volatility via the standard adjustment: mu_log = log(1 + mu_arith) - sigma^2 / 2. The correlation matrix captures the key empirical relationships: domestic and international equities are moderately correlated with each other (0.60), bonds and equities are nearly uncorrelated, and cash is slightly negatively correlated with international equities. These correlations are estimated on real return series historically but are reused here for nominal; equity correlations are only mildly distorted by this simplification while bond correlations are affected more (see caveat below).
+
+Each simulation path and each year draws an independent nominal return from this distribution, and the fitness function deflates it to real using the realized CIR inflation for that path/year:
+
+$$R^{\text{real}}_{t} = \frac{1 + R^{\text{nom}}_{t}}{1 + i_{t}} - 1$$
+
+**Bond and Inflation Real World Correlation** In reality nominal bond returns are strongly negatively correlated with inflation surprises. When inflation rises, nominal bonds sell off, compounding the real-value drag of deflation. The `cor_mat` here treats nominal returns and inflation as independent, so this second-order effect (bonds losing nominal value in high-inflation regimes on top of the deflation drag) is absent. A fully rigorous fix would extend the covariance matrix to five dimensions (four assets + inflation). For the current model we accept the simplification; the effect of high inflation on real bond return is still captured through the deflation step, just not amplified by the empirical nominal sell-off.
+
+```{r asset_params}
+asset_names <- c("Cash", "IntBond", "DomEq", "IntlEq")
+N_ASSETS    <- length(asset_names)
+# Real arithmetic returns (Ibbotson 1927-2006 style), then shifted up by cir_theta
+# to become nominal. cir_theta is defined in the User Parameters block below,
+# but we hardcode the same value (0.025) here to keep the chunks independent.
+mu_arith_real <- c(0.0081, 0.0252, 0.0948, 0.0725)
+mu_arith      <- mu_arith_real + 0.035   # nominal = real + long-run expected inflation
+sigma         <- c(0.0410, 0.0614, 0.2099, 0.2159)
+mu_log        <- log(1 + mu_arith) - sigma^2 / 2
+
+cor_mat <- matrix(c(
+  1.00,  0.40,  0.02, -0.05,
+  0.40,  1.00,  0.05,  0.02,
+  0.02,  0.05,  1.00,  0.60,
+ -0.05,  0.02,  0.60,  1.00
+), N_ASSETS, N_ASSETS)
+
+cov_mat <- diag(sigma) %*% cor_mat %*% diag(sigma)
+
+cat("Asset classes:             ", paste(asset_names, collapse = ", "), "\n")
+cat("N assets:                  ", N_ASSETS, "\n")
+cat("Arithmetic real returns:   ", paste(sprintf("%.2f%%", mu_arith_real * 100), collapse = ", "), "\n")
+cat("Arithmetic nominal returns:", paste(sprintf("%.2f%%", mu_arith * 100), collapse = ", "), "\n")
+cat("Standard deviations:       ", paste(sprintf("%.2f%%", sigma * 100), collapse = ", "), "\n")
+```
+
+# Personal Finance Params
+
+These are the personal financial assumptions that define the lifecycle simulation. They include current age, retirement age, starting savings, income and its real growth rate, the savings rate during working years, annual spending in retirement, Social Security benefits and their start age, a bequest target, and effective retirement tax rate. The mortality table is loaded from an external file produced by a separate mortality prediction model (currently constructed using a set fo realistic, random data). If that file is not found, the code falls back to a Gompertz hazard model as a reasonable approximation.
+
+The simulation assumes a Traditional 401(k)/IRA tax regime: contributions during working years are pre-tax and withdrawals in retirement are taxed as ordinary income. To produce `annual_spending` of real, after-tax spending power, the portfolio must be grossed up by the effective retirement tax rate. The net withdrawal each year becomes `(annual_spending - ss_net) / (1 - retirement_tax_rate)`, where `ss_net` is Social Security after its own tax treatment. We use an effective blended rate rather than modeling bracket progressivity explicitly. `retirement_tax_rate = 0.18` is a reasonable central estimate for a retiree at this spending level (federal blended plus no IL state tax on retirement income).
+
+Inflation is simulated alongside asset returns via a CIR process. 
+
+```{r user_params}
+# Personal finances
+current_age         <- 30
+retirement_age      <- 65
+current_savings     <- 70000
+current_income      <- 85000
+savings_rate        <- 0.17
+real_income_growth  <- 0.015
+annual_spending     <- 80000
+ss_benefit          <- 24000
+ss_start_age        <- 67
+bequest_target      <- 1500000
+retirement_tax_rate <- 0.18 # effective blended rate on Traditional 401(k)/IRA withdrawals
+ss_taxable_frac     <- 0.85 # fraction of SS subject to income tax (per IRS rules, max 85%)
+# CIR inflation params
+cir_kappa              <- 0.30 # mean-reversion speed
+cir_theta              <- 0.035 # long-run mean
+cir_sigma              <- 0.015 # volatility
+cir_i0                 <- 0.025 # starting level
+```
+
+# CMA-ES and Bernstein Params
+
+This chunk sets the hyperparameters that control the optimizer and the polynomial parameterization. N_CPTS is the number of Bernstein control points per asset class, and the total dimensionality of the search space is N_ASSETS * N_CPTS since each asset gets its own independent curve. CMAES_POP_SIZE (lambda) is the number of candidate solutions sampled per generation. CMAES_MAX_GEN caps the number of generations, and CMAES_TOL together with CMAES_STALL_LIM control early stopping: the optimizer halts if the best fitness does not improve by more than TOL for STALL_LIM consecutive generations, or if sigma collapses below 1e-5. CMAES_SIGMA0 is the initial step size in control-point space, and since control points live in [0,1], a starting sigma of 0.25 means the algorithm initially explores a range of roughly +/- 0.25 around the initial guess. N_MC is the number of Monte Carlo paths used to evaluate each candidate solution and is held fixed throughout the entire run.
+
+```{r cmaes_params}
+# Bernstein polynomial params
+N_CPTS <- 20 # number of control points per asset (= polynomial degree + 1)
+N_DIMS_TOTAL <- N_ASSETS * N_CPTS # total optimization dimensions
+# CMA-ES params
+CMAES_POP_SIZE <- 40 # lambda; slightly larger for higher dimensions
+CMAES_MAX_GEN <- 120 # more generations for the larger search space
+CMAES_TOL <- 1e-7
+CMAES_SIGMA0 <- 0.25 # initial step size in control-point space [0,1]
+CMAES_STALL_LIM <- 40
+# Single fixed MC budget (no phase switching)
+N_MC <- 50000 # LHS paths per fitness evaluation
+N_CORES <- max(1L, detectCores() - 1L) # use all cores available
+
+cat(sprintf("Asset classes:            %d (%s)\n", N_ASSETS, paste(asset_names, collapse=", ")))
+cat(sprintf("Control points per asset: %d\n", N_CPTS))
+cat(sprintf("Total optimization dims:  %d\n", N_DIMS_TOTAL))
+cat(sprintf("Population size:          %d\n", CMAES_POP_SIZE))
+cat(sprintf("Max generations:          %d\n", CMAES_MAX_GEN))
+cat(sprintf("Initial sigma:            %.2f\n", CMAES_SIGMA0))
+cat(sprintf("MC paths:                 %s\n", format(N_MC, big.mark = ",")))
+cat(sprintf("Parallel cores:           %d\n", N_CORES))
+```
+
+# Load Mortality CDF
+
+This chunk loads a customizable mortality table from an external .rds file. The mortality table provides, for each age, the probability of dying at that age and the cumulative probability of having died by that age. Each Monte Carlo path is assigned a random death age drawn from this distribution, and the simulation for that path ends at that age. 
+
+If the external mortality file is not found, the code falls back to a parametric Gompertz hazard model, which models the force of mortality as an exponential function of age: h(x) = a * exp(b * (x - 30)). The parameters a = 0.00003 and b = 0.085 produce a reasonable approximation of adult mortality in developed countries. The plot shows the cumulative mortality CDF with reference lines for the median death age and the retirement age.
+
+```{r load_mortality, fig.width=9, fig.height=5}
+if (file.exists(mortality_path)){
+  mc_mort        <- readRDS(mortality_path)
+  mort_table     <- mc_mort$mortality_table
+  current_age <- mc_mort$current_age
+
+  cat(sprintf("Loaded personalized mortality from: %s\n", mortality_path))
+  cat(sprintf("Current age:        %d\n", current_age))
+  cat(sprintf("Median death age:   %.1f\n", mc_mort$median_death_age))
+  cat(sprintf("Expected death age: %.1f\n", mc_mort$expected_death_age))
+} else {
+  cat("WARNING:", mortality_path, "not found. Using Gompertz fallback.\n")
+  ages <- current_age:110
+  a <- 0.00003; b <- 0.085
+  haz  <- a * exp(b * (ages - 30))
+  surv <- cumprod(1 - pmin(haz, 1))
+  dp   <- c(1, surv[-length(surv)]) - surv
+  dp   <- pmax(dp, 0); dp <- dp / sum(dp)
+  mort_table <- data.frame(
+    age = ages, survival_prob = surv,
+    death_prob = dp, cum_death_prob = cumsum(dp)
+  )
+  mc_mort <- list(
+    current_age        = current_age,
+    median_death_age   = ages[which.min(abs(cumsum(dp) - 0.5))],
+    expected_death_age = sum(ages * dp),
+    sd_death_age       = sqrt(sum((ages - sum(ages * dp))^2 * dp)),
+    mortality_table    = mort_table
+  )
+}
+
+max_age       <- max(mort_table$age)
+n_years_total <- max_age - current_age
+
+ggplot(mort_table, aes(x = age, y = cum_death_prob)) +
+  geom_line(color = "firebrick", linewidth = 1.2) +
+  geom_vline(xintercept = mc_mort$median_death_age, linetype = "dashed") +
+  geom_vline(xintercept = retirement_age, linetype = "dotted", color = "steelblue") +
+  annotate("text", x = mc_mort$median_death_age + 1, y = 0.55,
+           label = paste0("Median death: ", round(mc_mort$median_death_age, 1)),
+           hjust = 0, size = 3.5) +
+  annotate("text", x = retirement_age + 1, y = 0.05,
+           label = paste0("Retirement: ", retirement_age),
+           hjust = 0, color = "steelblue", size = 3.5) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Personalized Mortality CDF",
+       x = "Age", y = "Cumulative Probability of Death") +
+  theme_minimal(base_size = 14)
+
+cat(sprintf("\nLifespan horizon: age %d to %d (%d years)\n",
+            current_age + 1, max_age, n_years_total))
+```
+
+# Bernstein Polynomial Engine
+
+This chunk implements the Bernstein Polynomial machinery. The k-th Bernstein basis function of degree n at parameter tau is $\binom{n}{k} \tau^k (1-\tau)^{n-k}$, which R provides directly as `dbinom(k, n, tau)`. Since the basis depends only on the shape parameters (number of control points and number of years) and not on the control-point values themselves, we precompute the full `n_years * n_cpts` basis matrix `B_BASIS` once at chunk-load time.
+
+The function bernstein_weight_paths() is the generalization to N asset classes. It takes a flat candidate vector of length N_ASSETS * N_CPTS, reshapes it into an (n_cpts * N_ASSETS) matrix of control points, multiplies by the pre-computed basis matrix to get all asset curves in a single matrix product, and then normalizes the K raw values at each year so they sum to one. The result is a matrix of dimension n_years_total * N_ASSETS, where each row is a valid portfolio weight vector. Because each raw curve is in [0,1] and we normalize by dividing by the sum, the weights are guaranteed to be non-negative and to sum to one at every age, with no additional constraints needed.
+
+```{r bernstein}
+# Precompute the Bernstein basis matrix: row t gives the n_cpts basis function
+# values at tau_t = (t-1)/(n_years-1). Columns are basis functions b_0..b_{n-1}.
+# Depends only on shape parameters, not control points, so build it once.
+build_bernstein_basis <- function(n_years, n_cpts){
+  tau_seq <- seq(0, 1, length.out = n_years)
+  n       <- n_cpts - 1
+  outer(tau_seq, 0:n, function(tau, k) dbinom(k, n, tau))
+}
+B_BASIS <- build_bernstein_basis(n_years_total, N_CPTS)
+# Generalized: flat beta vector -> n_years x N_ASSETS weight matrix (rows sum to 1)
+bernstein_weight_paths <- function(beta_flat, n_assets = N_ASSETS, n_cpts = N_CPTS,
+                                   n_years = n_years_total){
+  beta_flat <- pmin(pmax(beta_flat, 0), 1)
+  # Reshape flat vector -> (n_cpts x n_assets) matrix of control points
+  beta_mat  <- matrix(beta_flat, nrow = n_cpts, ncol = n_assets)
+  # Single matrix multiply produces all asset curves: (n_years x n_cpts) %*% (n_cpts x n_assets)
+  raw_paths <- B_BASIS %*% beta_mat
+  # Normalize rows to sum to 1 (all raw values are in [0,1] by convex hull)
+  row_sums  <- rowSums(raw_paths)
+  row_sums[row_sums == 0] <- 1  # safety: avoid division by zero
+  raw_paths / row_sums
+}
+# plots of some basic examples of glide path allocations made using BP control points
+demo1 <- c(rep(0.8, N_CPTS), rep(0.6, N_CPTS), rep(0.9, N_CPTS), rep(0.3, N_CPTS))
+demo2 <- c(seq(0.9, 0.2, length.out = N_CPTS), seq(0.2, 0.8, length.out = N_CPTS),
+           seq(0.5, 0.9, length.out = N_CPTS), seq(0.3, 0.5, length.out = N_CPTS))
+demo_w1 <- bernstein_weight_paths(demo1)
+demo_w2 <- bernstein_weight_paths(demo2)
+demo_plot_df <- bind_rows(
+  data.frame(age = (current_age + 1):max_age, demo_w1, shape = "Flat weights") %>%
+    setNames(c("age", asset_names, "shape")),
+  data.frame(age = (current_age + 1):max_age, demo_w2, shape = "Upward/Downward Trending weights") %>%
+    setNames(c("age", asset_names, "shape"))
+) %>%
+  pivot_longer(cols = all_of(asset_names), names_to = "asset", values_to = "weight") %>%
+  mutate(asset = factor(asset, levels = asset_names))
+# Build a tidy data frame of control points. Each asset's N_CPTS control points live at tau = seq(0, 1, length.out = N_CPTS), which maps to ages evenly spaced from current_age + 1 to max_age. Points are plotted at their RAW (pre-normalization) values, which is what the optimizer actually manipulates. 
+# Because the area chartshows normalized weights but control points are raw, the dots will usually not sit on the visible curve. This is expected and conveys the separation between optimization space and realized allocation.
+cp_ages <- round(seq(current_age + 1, max_age, length.out = N_CPTS))
+make_cp_df <- function(beta_flat, shape_label){
+  beta_mat <- matrix(beta_flat, nrow = N_CPTS, ncol = N_ASSETS)
+  data.frame(
+    age    = rep(cp_ages, N_ASSETS),
+    asset  = factor(rep(asset_names, each = N_CPTS), levels = asset_names),
+    value  = as.numeric(beta_mat),
+    shape  = shape_label
+  )
+}
+demo_cp_df <- bind_rows(
+  make_cp_df(demo1, "Flat weights"),
+  make_cp_df(demo2, "Upward/Downward Trending weights")
+)
+
+ggplot(demo_plot_df, aes(x = age, y = weight, fill = asset)) +
+  geom_area(alpha = 0.8) +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey40") +
+  geom_point(data = demo_cp_df,
+             aes(x = age, y = value, color = asset),
+             inherit.aes = FALSE, size = 1.8, stroke = 0.6, shape = 21, fill = "white") +
+  facet_wrap(~shape) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = sprintf("Example N-Asset Bernstein Glide Paths (%d assets, %d Control Points each)",
+                       N_ASSETS, N_CPTS),
+       subtitle = "Filled areas = normalized weights; open dots = raw control-point values per asset",
+       x = "Age", y = "Portfolio Weight", fill = "", color = "") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+```
+
+# Generate Returns and Death Ages
+
+Before the optimization begins, this chunk generates the entire stochastic environment that every candidate solution will be evaluated against: a matrix of asset returns for every simulation path and every year, and a vector of death ages.
+
+The reason for pre-generating everything is that if we drew fresh random returns for every fitness evaluation, two candidates evaluated in the same generation would be compared on different random draws. Random noise would contaminate the fitness rankings, and the optimizer would waste generations chasing phantom improvements. By fixing the random draws once and reusing them for every evaluation in every generation, we guarantee that fitness differences between candidates reflect genuine differences in their glide paths, not sampling luck.
+
+Rather than plain Monte Carlo (independent uniform draws), we use Latin Hypercube Sampling (LHS) to generate the random inputs. LHS partitions each dimension of the input space into N_MC equal-probability strata and places exactly one sample in each stratum. This produces much more even coverage of the input space than simple random sampling, which tends to leave gaps and clusters. The result is lower variance in estimated statistics (like P(ruin)) for the same number of simulations, or equivalently, the same accuracy with fewer simulations.
+
+The procedure works as follows: 
+
+  1. generate a Latin Hypercube of uniform samples with N_MC rows and (N_ASSETS * n_years) columns
+  2. transform the uniform samples to standard normal via the inverse CDF
+  3. apply the Cholesky factor of the covariance matrix to introduce cross-asset correlations
+  4. shift by the log-space means, then exponentiate and subtract 1 to get arithmetic returns
+  
+The return generator is fully generic over the number of asset classes and returns a 3D array of dimension (N_MC * n_years * N_ASSETS). Death ages are sampled by drawing a uniform random number for each simulation path and inverting the mortality CDF. The verification block at the end compares the realized sample means to the target arithmetic means to confirm the LHS draws are correct.
+
+```{r pregenerate}
+sample_death_ages <- function(n, mort_table){
+  u <- runif(n)
+  sapply(u, function(p){
+    idx <- which(mort_table$cum_death_prob >= p)[1]
+    if (is.na(idx)) max(mort_table$age) else mort_table$age[idx]
+  })
+}
+
+generate_lhs_returns <- function(n_sims, n_years, n_assets, cov_mat, mu_log, seed){
+  set.seed(seed)
+  lhs_raw <- randomLHS(n_sims, n_assets * n_years)
+  z_lhs   <- qnorm(lhs_raw)
+  L       <- t(chol(cov_mat))
+  # 3D array: simulations * years * assets
+  ret_array <- array(NA_real_, dim = c(n_sims, n_years, n_assets))
+
+  for (t in 1:n_years){
+    cols     <- ((t - 1) * n_assets + 1):(t * n_assets)
+    corr_log <- sweep(z_lhs[, cols] %*% t(L), 2, mu_log, "+")
+    ret_array[, t, ] <- exp(corr_log) - 1
+  }
+  ret_array
+}
+
+# Generic CIR path generator: Euler discretization with reflection at zero.
+# Used for both inflation and real-income-growth paths.
+# Returns (n_sims x n_years) matrix of realized rates per path per year.
+generate_cir_path <- function(n_sims, n_years, kappa, theta, sigma, i0, seed){
+  set.seed(seed)
+  x <- matrix(NA_real_, nrow = n_sims, ncol = n_years)
+  prev <- rep(i0, n_sims)
+  for (t in 1:n_years){
+    dW     <- rnorm(n_sims)
+    next_x <- prev + kappa * (theta - prev) + sigma * sqrt(pmax(prev, 0)) * dW
+    next_x <- pmax(next_x, 0)  # reflect at zero (safety for discretization)
+    x[, t] <- next_x
+    prev   <- next_x
+  }
+  x
+}
+
+cat("Generating LHS returns, CIR inflation, CIR income growth, and death ages...\n")
+t0_lhs <- Sys.time()
+
+set.seed(42)
+death_ages <- sample_death_ages(N_MC, mort_table)
+ret_array  <- generate_lhs_returns(N_MC, n_years_total, N_ASSETS, cov_mat, mu_log, seed = 123)
+infl_array <- generate_cir_path(N_MC, n_years_total, cir_kappa, cir_theta,
+                                      cir_sigma, cir_i0, seed = 456)
+
+elapsed_lhs <- as.numeric(difftime(Sys.time(), t0_lhs, units = "secs"))
+cat(sprintf("Done: %s paths x %d assets + CIR inflation in %.1f seconds.\n",
+            format(N_MC, big.mark=","), N_ASSETS, elapsed_lhs))
+
+cat(sprintf("\nReturn verification:\n"))
+for (k in seq_len(N_ASSETS)){
+  cat(sprintf("  %-8s %.3f%% (target %.3f%%)\n",
+              paste0(asset_names[k], ":"),
+              mean(ret_array[, , k]) * 100, mu_arith[k] * 100))
+}
+
+cat(sprintf("\nCIR inflation verification:\n"))
+cat(sprintf("  Mean realized: %.3f%% (target theta: %.3f%%)\n",
+            mean(infl_array) * 100, cir_theta * 100))
+cat(sprintf("  SD realized:   %.3f%%\n", sd(infl_array) * 100))
+cat(sprintf("  Min / Max:     %.3f%% / %.3f%%\n",
+            min(infl_array) * 100, max(infl_array) * 100))
+```
+
+# CMA-ES Fitness Function
+
+This is the core of the simulation. The fitness function takes a single candidate solution, a flat vector of length N_ASSETS * N_CPTS, and returns a measure of how good the resulting multi-asset glide path is.
+
+The candidate vector is first passed to bernstein_weight_paths(), which reshapes it into one Bernstein curve per asset, expands each curve across the full lifespan, and normalizes the resulting values at each year so the portfolio weights sum to one. The lifecycle simulation then runs for each of the N_MC Monte Carlo paths, stepping year by year from the current age to the maximum age. During working years, annual savings contributions are added (pre-tax, as per the Traditional 401(k)/IRA regime). The portfolio return each year is the dot product of the weight vector for that year with the vector of asset returns for that year, which is completely generic over the number of asset classes. During retirement, the portfolio is drawn down by the *gross* withdrawal required to net `annual_spending` after tax: Social Security is reduced by the tax on its taxable portion (`ss_taxable_frac * retirement_tax_rate`), and the remaining spending need is grossed up by `1 / (1 - retirement_tax_rate)` to cover the tax on Traditional account withdrawals. If wealth drops to zero, the path is marked as ruined. When the simulation reaches the path's randomly assigned death age, the terminal wealth is recorded.
+
+The ruin probability is the fraction of simulation paths that survived to retirement and ran out of money before death, and this is the primary fitness metric (lower is better). P(bequest) is the fraction of paths whose terminal wealth exceeds the bequest target, and median terminal wealth and path roughness are also returned for monitoring but do not enter the fitness score. Roughness is now computed as the sum of squared year-over-year changes across all asset weight curves.
+
+```{r fitness_fn}
+make_fitness_fn <- function(ret_array, infl_array, death_ages, n_sims){
+  function(beta_flat){
+    # Expand to n_years * N_ASSETS weight matrix (rows sum to 1)
+    W <- bernstein_weight_paths(beta_flat)
+
+    wealth          <- rep(current_savings, n_sims)
+    income          <- rep(current_income,  n_sims)
+    ruined          <- rep(FALSE, n_sims)
+    terminal_wealth <- rep(0.0, n_sims)
+    da              <- death_ages
+
+    for (t in seq_len(n_years_total)){
+      age    <- current_age + t
+      active <- (da >= age) & !ruined
+      if (!any(active)) break
+
+      if (age <= retirement_age){
+        wealth[active] <- wealth[active] + income[active] * savings_rate
+      }
+      # Nominal portfolio return (dot product of weights with nominal asset returns),
+      # deflated to real using realized CIR inflation for this path/year.
+      port_r_nom  <- as.numeric(ret_array[, t, ] %*% W[t, ])
+      port_r_real <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+      wealth[active] <- wealth[active] * (1 + port_r_real[active])
+
+      if (age > retirement_age){
+        # Social Security: taxable portion (up to 85%) taxed at retirement rate
+        ss_gross <- ifelse(age >= ss_start_age, ss_benefit, 0)
+        ss_net   <- ss_gross * (1 - ss_taxable_frac * retirement_tax_rate)
+        # Remaining spending need is grossed up to cover tax on Traditional withdrawal
+        net_need <- pmax(annual_spending - ss_net, 0)
+        needed   <- net_need / (1 - retirement_tax_rate)
+        wealth[active] <- wealth[active] - needed
+        new_ruin <- active & (wealth <= 0)
+        ruined[new_ruin] <- TRUE
+        wealth[ruined]   <- 0
+      }
+
+      if (age <= retirement_age){
+        income[active] <- income[active] * (1 + real_income_growth)
+      }
+
+      dying <- (da == age) & !ruined
+      terminal_wealth[dying] <- wealth[dying]
+      terminal_wealth[da == age & ruined] <- 0
+    }
+
+    retired <- da > retirement_age
+    p_ruin  <- if (sum(retired) > 0) mean(ruined[retired]) else 1.0
+    # Roughness: sum of squared diffs across all asset weight curves
+    roughness <- sum(apply(W, 2, function(col) sum(diff(col)^2)))
+
+    list(
+      p_ruin        = p_ruin,
+      fitness       = p_ruin, # pure P(ruin)
+      roughness     = roughness, # diagnostic only
+      weight_paths  = W,
+      beta          = pmin(pmax(beta_flat, 0), 1),
+      p_bequest     = mean(terminal_wealth >= bequest_target),
+      median_wealth = median(terminal_wealth)
+    )
+  }
+}
+
+fitness_fn <- make_fitness_fn(ret_array, infl_array, death_ages, N_MC)
+
+cat(sprintf("Fitness function created.\n"))
+cat(sprintf("Search space: %d assets * %d control points = %d dims -> %d-year smooth weight paths.\n",
+            N_ASSETS, N_CPTS, N_DIMS_TOTAL, n_years_total))
+```
+
+# CMA-ES Implementation
+
+This chunk implements the full sep-CMA-ES optimization loop. Here is what happens at each generation:
+
+The mean vector m is initialized to sensible starting weights for each asset class. The diagonal covariance C_diag is set to all ones, the evolution paths p_sigma and p_c are initialized to zero, and sigma starts at CMAES_SIGMA0. Each generation, lambda candidate solutions are drawn from the distribution N(m, sigma^2 * diag(C_diag)) and then clamped to [0,1], with each candidate being a flat vector of length N_DIMS_TOTAL. All lambda candidates are evaluated in parallel on the same pre-generated Monte Carlo paths, where each evaluation expands the control points into a full set of weight paths via the Bernstein polynomial engine, runs the life cycle simulation, and returns the ruin probability.
+
+After evaluation, candidates are sorted by fitness (P(ruin), lower is preferred) and the best mu candidates are combined via log-weighted averaging to produce the new mean m. Two evolution paths are then updated. The sigma path (p_sigma) tracks the cumulative displacement of the mean in a coordinate system normalized by the covariance matrix and is used to adapt sigma via cumulative step-size adaptation (CSA): if the path is longer than expected under random selection, sigma is too small and is increased, and if shorter, sigma is too large and is decreased. The covariance path (p_c) tracks displacement in the original coordinate system and is used in the rank-one update of the covariance matrix. The diagonal covariance C_diag is updated with three components: a decay term (shrinking toward the current value), a rank-one term (based on p_c), and a rank-mu term (based on the spread of the selected candidates), which allows the algorithm to learn which control points have more or less influence on fitness and to adjust their exploration ranges accordingly. Sigma is adapted based on the length of the sigma evolution path relative to its expected length under a random walk, which ensures sigma shrinks as the algorithm converges and does not shrink prematurely if the algorithm is still making progress.
+
+The loop ends when any of three conditions is met: sigma falls below 1e-5 (the search has collapsed to a point), the best fitness has not improved for STALL_LIM consecutive generations, or the maximum number of generations is reached. A parallel cluster is created at the start and used for all fitness evaluations throughout the run, and it is automatically shut down when the function exits.
+
+```{r cmaes_engine}
+cmaes_optimize <- function(n_dims     = N_DIMS_TOTAL,
+                            pop_size   = CMAES_POP_SIZE,
+                            max_gen    = CMAES_MAX_GEN,
+                            sigma0     = CMAES_SIGMA0,
+                            tol        = CMAES_TOL,
+                            stall_lim  = CMAES_STALL_LIM,
+                            verbose    = TRUE){
+
+  lambda  <- pop_size
+  mu      <- floor(lambda / 2)
+  raw_w   <- log(mu + 0.5) - log(1:mu)
+  weights <- raw_w / sum(raw_w)
+  mu_eff  <- 1 / sum(weights^2)
+
+  c_sigma <- (mu_eff + 2) / (n_dims + mu_eff + 5)
+  d_sigma <- 1 + 2 * max(0, sqrt((mu_eff - 1) / (n_dims + 1)) - 1) + c_sigma
+  c_c     <- (4 + mu_eff / n_dims) / (n_dims + 4 + 2 * mu_eff / n_dims)
+  c_1     <- 2 / ((n_dims + 1.3)^2 + mu_eff)
+  c_mu_r  <- min(1 - c_1, 2 * (mu_eff - 2 + 1/mu_eff) / ((n_dims + 2)^2 + mu_eff))
+  chi_n   <- sqrt(n_dims) * (1 - 1/(4*n_dims) + 1/(21*n_dims^2))
+  # Initialize starting allocation (try different values and observe indistinguishable convergence)
+  init_vals <- c(0.25, 0.25, 0.25, 0.25) # Cash, IntBond, DomEq, IntlEq
+  m <- rep(init_vals, each = N_CPTS)
+
+  sigma   <- sigma0
+  C_diag  <- rep(1.0, n_dims)
+  p_sigma <- rep(0.0, n_dims)
+  p_c     <- rep(0.0, n_dims)
+
+  best_fitness_ever <- Inf
+  best_ruin_ever    <- Inf
+  best_beta_ever    <- m
+  best_details_ever <- NULL
+  history           <- data.frame()
+  stall_count       <- 0
+  prev_best         <- Inf
+
+  cat(sprintf("  sep-CMA-ES: %d assets * %d CPs = %d dims, lambda=%d, mu=%d, mu_eff=%.1f\n",
+              N_ASSETS, N_CPTS, n_dims, lambda, mu, mu_eff))
+  cat(sprintf("  MC budget: %s fixed LHS paths per evaluation\n",
+              format(N_MC, big.mark=",")))
+  cat(sprintf("  Parallel cores: %d\n\n", N_CORES))
+
+  cl <- makeCluster(N_CORES)
+  on.exit(stopCluster(cl), add = TRUE)
+
+  clusterExport(cl, varlist = c(
+    "make_fitness_fn", "bernstein_weight_paths", "B_BASIS",
+    "ret_array", "infl_array", "death_ages",
+    "n_years_total", "N_CPTS", "N_MC", "N_ASSETS",
+    "current_age", "retirement_age", "ss_start_age",
+    "current_savings", "current_income", "savings_rate",
+    "real_income_growth", "annual_spending",
+    "ss_benefit", "bequest_target",
+    "retirement_tax_rate", "ss_taxable_frac",
+    "fitness_fn"
+  ), envir = environment())
+
+  t0 <- Sys.time()
+
+  for (gen in 1:max_gen){
+    # Sample lambda candidates from [0,1]
+    candidates <- matrix(NA_real_, nrow = lambda, ncol = n_dims)
+    for (k in 1:lambda){
+      z <- rnorm(n_dims)
+      candidates[k, ] <- pmin(pmax(m + sigma * sqrt(C_diag) * z, 0), 1)
+    }
+    # Parallel fitness evaluation (same fixed MC budget every generation)
+    cand_list    <- lapply(seq_len(lambda), function(k) candidates[k, ])
+    results_list <- parLapply(cl, cand_list, function(cand) fitness_fn(cand))
+
+    fitvals   <- sapply(results_list, `[[`, "fitness")
+    ruin_vals <- sapply(results_list, `[[`, "p_ruin")
+    details   <- results_list
+
+    ord        <- order(fitvals)
+    fitvals    <- fitvals[ord]
+    ruin_vals  <- ruin_vals[ord]
+    candidates <- candidates[ord, , drop = FALSE]
+    details    <- details[ord]
+
+    m_old <- m
+    m     <- as.numeric(weights %*% candidates[1:mu, , drop = FALSE])
+
+    invsqrt_C <- 1 / sqrt(C_diag)
+    step      <- (m - m_old) / sigma
+
+    p_sigma <- (1 - c_sigma) * p_sigma +
+               sqrt(c_sigma * (2 - c_sigma) * mu_eff) * invsqrt_C * step
+
+    h_sigma <- as.numeric(
+      sum(p_sigma^2) / n_dims / (1 - (1 - c_sigma)^(2*(gen+1))) < 2 + 4/(n_dims+1)
+    )
+
+    p_c <- (1 - c_c) * p_c +
+           h_sigma * sqrt(c_c * (2 - c_c) * mu_eff) * step
+
+    artmp  <- (candidates[1:mu, , drop = FALSE] - rep(m_old, each = mu)) / sigma
+    C_diag <- (1 - c_1 - c_mu_r) * C_diag +
+              c_1 * (p_c^2 + (1 - h_sigma) * c_c * (2 - c_c) * C_diag) +
+              c_mu_r * as.numeric(weights %*% artmp^2)
+    C_diag <- pmax(C_diag, 1e-20)
+
+    sigma <- sigma * exp((c_sigma / d_sigma) * (sqrt(sum(p_sigma^2)) / chi_n - 1))
+    sigma <- min(sigma, 1.0)
+
+    gen_best_fit  <- fitvals[1]
+    gen_best_ruin <- ruin_vals[1]
+    gen_best_det  <- details[[1]]
+
+    if (gen_best_fit < best_fitness_ever){
+      best_fitness_ever <- gen_best_fit
+      best_ruin_ever    <- gen_best_ruin
+      best_beta_ever    <- candidates[1, ]
+      best_details_ever <- gen_best_det
+    }
+
+    if (abs(prev_best - gen_best_fit) < tol){
+      stall_count <- stall_count + 1
+    } else {
+      stall_count <- 0
+    }
+    prev_best <- gen_best_fit
+
+    history <- bind_rows(history, data.frame(
+      gen            = gen,
+      best_ruin      = gen_best_ruin,
+      mean_ruin      = mean(ruin_vals),
+      best_fit       = gen_best_fit,
+      mean_fit       = mean(fitvals),
+      roughness      = gen_best_det$roughness,
+      best_beq       = gen_best_det$p_bequest,
+      median_w       = gen_best_det$median_wealth,
+      sigma          = sigma,
+      best_ever_ruin = best_ruin_ever
+    ))
+
+    if (verbose && (gen %% 10 == 0 || gen <= 5 || gen == max_gen)){
+      elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+      cat(sprintf("  Gen %3d | P(ruin)=%.3f%% | P(beq)=%.1f%% | rough=%.4f | sig=%.4f | %.1fmin\n",
+                  gen, gen_best_ruin * 100,
+                  gen_best_det$p_bequest * 100, gen_best_det$roughness,
+                  sigma, elapsed))
+    }
+
+    if (stall_count >= stall_lim){
+      cat(sprintf("\n  Converged at generation %d (stalled %d gens)\n",
+                  gen, stall_lim))
+      break
+    }
+    if (sigma < 1e-5){
+      cat(sprintf("\n  Converged at generation %d (sigma collapsed to %.2e)\n", gen, sigma))
+      break
+    }
+  }
+
+  elapsed_total <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+
+  final <- fitness_fn(best_beta_ever)
+
+  cat(sprintf("\n  CMA-ES complete:     %d generations in %.1f minutes\n", gen, elapsed_total))
+  cat(sprintf("  Final P(ruin):         %.2f%%\n", final$p_ruin * 100))
+  cat(sprintf("  Final P(bequest):      %.1f%%\n", final$p_bequest * 100))
+  cat(sprintf("  Final median $ (real): $%s\n", format(round(final$median_wealth), big.mark=",")))
+  cat(sprintf("  Path roughness:        %.4f\n", final$roughness))
+
+  list(
+    best_beta     = final$beta,
+    best_weights  = final$weight_paths,
+    best_fitness  = final$fitness,
+    best_ruin     = final$p_ruin,
+    best_details  = final,
+    history       = history,
+    n_gens        = gen,
+    elapsed_min   = elapsed_total
+  )
+}
+```
+
+# Run Optimization
+
+This chunk calls the optimizer. The optimizer prints progress every 10 generations showing the current best P(ruin), P(bequest), roughness, sigma, and elapsed time. When it converges (via stall detection or sigma collapse), it re-evaluates the best solution one final time and returns the complete results.
+
+```{r run_cmaes, cache=FALSE}
+cat("STARTING CMA-ES OPTIMIZATION\n\n")
+result <- cmaes_optimize()
+```
+
+# Optimized Glide Path
+
+Now a full N-asset allocation glide path has been discovered by CMA-ES, tailor made to a retirement investor's particularities. The stacked area chart shows the portfolio weight of every asset class at every age from the current age to the maximum lifespan. Each asset's allocation over time is a smooth Bernstein polynomial curve, and the normalization ensures the weights sum to one at every age. Reference lines mark the retirement age and median death age to provide context for interpreting the shape.
+
+```{r glide_path, fig.width=10, fig.height=6}
+W <- result$best_weights
+
+path_df <- data.frame(age = (current_age + 1):max_age, W)
+colnames(path_df) <- c("age", asset_names)
+
+path_df %>%
+  pivot_longer(cols = all_of(asset_names), names_to = "asset", values_to = "weight") %>%
+  mutate(asset = factor(asset, levels = asset_names)) %>%
+  ggplot(aes(x = age, y = weight, fill = asset)) +
+  geom_area(alpha = 0.85) +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey30") +
+  geom_vline(xintercept = mc_mort$median_death_age, linetype = "dotted", color = "grey10") +
+  annotate("text", x = retirement_age + 1, y = 0.97,
+           label = paste("Retire:", retirement_age), hjust = 0, size = 3.5) +
+  annotate("text", x = mc_mort$median_death_age + 1, y = 0.85,
+           label = paste("Median death:", round(mc_mort$median_death_age, 1)),
+           hjust = 0, size = 3.5) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "CMA-ES Optimized N-Asset Lifetime Glide Path",
+       subtitle = sprintf("P(ruin)=%.2f%% | P(bequest>=$%sk)=%.1f%% | Median wealth=$%s | %d assets * %d Control Points",
+                          result$best_ruin * 100,
+                          format(bequest_target / 1000, big.mark = ","),
+                          result$best_details$p_bequest * 100,
+                          format(round(result$best_details$median_wealth), big.mark = ","),
+                          N_ASSETS, N_CPTS),
+       x = "Age", y = "Portfolio Weight", fill = "") +
+  theme_minimal(base_size = 14)
+```
+
+# Individual Asset Curves
+
+This plot shows each asset's weight as a separate line, making it easier to read the exact allocation at any given age than the stacked area chart above.
+
+```{r individual_curves, fig.width=10, fig.height=5}
+path_df %>%
+  pivot_longer(cols = all_of(asset_names), names_to = "asset", values_to = "weight") %>%
+  mutate(asset = factor(asset, levels = asset_names)) %>%
+  ggplot(aes(x = age, y = weight, color = asset)) +
+  geom_line(linewidth = 1.1) +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, NA)) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "Individual Asset Weight Curves",
+       x = "Age", y = "Portfolio Weight", color = "") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+```
+
+# Control Point Values
+
+These plots display the optimized Bernstein control points and their fitted curves for each asset class. Each control point is associated with a life-stage age (spaced evenly across the lifespan).
+
+```{r cp_table}
+cp_age_labels <- round(seq(current_age + 1, max_age, length.out = N_CPTS))
+beta_mat <- matrix(result$best_beta, nrow = N_CPTS, ncol = N_ASSETS)
+# Control points
+cp_plot_df <- data.frame(
+  age   = rep(cp_age_labels, N_ASSETS),
+  asset = factor(rep(asset_names, each = N_CPTS), levels = asset_names),
+  raw   = as.numeric(beta_mat)
+)
+# Fitted Bernstein curves evaluated at every year of life, per asset
+curve_ages <- (current_age + 1):max_age
+fit_df <- do.call(rbind, lapply(seq_len(N_ASSETS), function(k){
+  data.frame(
+    age   = curve_ages,
+    asset = factor(asset_names[k], levels = asset_names),
+    fit   = as.numeric(B_BASIS %*% beta_mat[, k])
+  )
+}))
+# plot
+ggplot() +
+  geom_line(data = fit_df,
+            aes(x = age, y = fit, color = asset),
+            linewidth = 1) +
+  geom_point(data = cp_plot_df,
+             aes(x = age, y = raw, color = asset),
+             size = 2.3, shape = 21, fill = "white", stroke = 1) +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey40") +
+  annotate("text", x = retirement_age + 0.5, y = 1.0,
+           label = sprintf("Retire at %d", retirement_age),
+           hjust = 0, size = 3.3, color = "grey30") +
+  facet_wrap(~ asset, ncol = 2) +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25),
+                     labels = percent_format()) +
+  labs(title = "Optimized Bernstein Control Points by Asset",
+       subtitle = "Open dots = raw control-point values; solid line = Bernstein curve through them",
+       x = "Age", y = "Raw value") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"))
+```
+
+# Input and Output Distributions
+
+This section shows the underlying distributions of the simulation. The summary statistics (P(ruin), P(bequest), median terminal wealth) reduce the full simulation to three numbers. The inputs are the asset returns, CIR inflation, and sampled death ages. Verifying these against their calibration targets catches generator bugs and confirms the simulated environment matches intent. The outputs are annual portfolio returns, terminal wealth, and age of ruin, which expose shape characteristics (fat tails, when ruin occurs, how wealth is distributed across surviving paths) that the scalar summary statistics simplify. 
+
+## Input Distributions
+
+### Asset returns (nominal)
+
+Each asset's realized nominal annual return distribution, pooled across all `N_MC` paths and all `n_years_total` years. The LHS + Cholesky generator targets the calibrated nominal arithmetic means (real + `cir_theta`) and standard deviations. These histograms verify the targets are hit and show the empirical shape (lognormal). These are the pre-deflation draws; the per-path realized real returns used by the simulation are these minus the corresponding CIR inflation draw, and are shown as the "portfolio returns" distribution below.
+
+```{r dist_asset_returns, fig.width=11, fig.height=6}
+asset_returns_long <- do.call(rbind, lapply(seq_len(N_ASSETS), function(k){
+  data.frame(
+    asset  = asset_names[k],
+    return = as.numeric(ret_array[, , k])
+  )
+})) %>% mutate(asset = factor(asset, levels = asset_names))
+
+# Summary statistics per asset
+asset_stats <- asset_returns_long %>%
+  group_by(asset) %>%
+  summarize(
+    n        = n(),
+    mean     = mean(return),
+    sd       = sd(return),
+    median   = median(return),
+    p05      = quantile(return, 0.05, names = FALSE),
+    p95      = quantile(return, 0.95, names = FALSE),
+    skewness = mean(((return - mean(return)) / sd(return))^3),
+    kurtosis = mean(((return - mean(return)) / sd(return))^4),
+    .groups  = "drop"
+  )
+
+asset_stats_print <- asset_stats %>%
+  transmute(
+    Asset    = asset,
+    N        = format(n, big.mark = ","),
+    Mean     = sprintf("%.3f%%", mean * 100),
+    SD       = sprintf("%.3f%%", sd * 100),
+    Median   = sprintf("%.3f%%", median * 100),
+    `p05`    = sprintf("%.2f%%", p05 * 100),
+    `p95`    = sprintf("%.2f%%", p95 * 100),
+    Skew     = sprintf("%+.3f", skewness),
+    Kurtosis = sprintf("%.2f", kurtosis)
+  )
+print(asset_stats_print, row.names = FALSE)
+
+ggplot(asset_returns_long, aes(x = return * 100, fill = asset)) +
+  geom_histogram(bins = 80, alpha = 0.85, color = "white", linewidth = 0.1) +
+  facet_wrap(~ asset, scales = "free", ncol = 2) +
+  geom_vline(data = asset_stats, aes(xintercept = mean * 100),
+             linetype = "dashed", color = "grey20") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Asset Return Distributions (marginal, per asset class, nominal)",
+       subtitle = "All N_MC paths x all years pooled. Dashed line = mean.",
+       x = "Annual return (%)", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+### Inflation distribution
+
+Realized inflation pooled across all paths and years. CIR mean-reverts to `cir_theta`, so the distribution should be centered near that value with a right-skewed tail (square-root diffusion gives heteroskedastic, but bounded-below behavior). Early path samples are near the starting value; later samples reflect the stationary distribution.
+
+```{r dist_inflation, fig.width=11, fig.height=5}
+inflation_flat <- as.numeric(infl_array)
+
+cir_stats <- data.frame(
+  Metric = c("Target theta", "Realized mean", "Realized SD",
+             "Realized median", "p05", "p95", "Min", "Max"),
+  Value = c(
+    sprintf("%.3f%%", cir_theta * 100),
+    sprintf("%.3f%%", mean(inflation_flat) * 100),
+    sprintf("%.3f%%", sd(inflation_flat) * 100),
+    sprintf("%.3f%%", median(inflation_flat) * 100),
+    sprintf("%.3f%%", quantile(inflation_flat, 0.05, names = FALSE) * 100),
+    sprintf("%.3f%%", quantile(inflation_flat, 0.95, names = FALSE) * 100),
+    sprintf("%.3f%%", min(inflation_flat) * 100),
+    sprintf("%.3f%%", max(inflation_flat) * 100)
+  )
+)
+
+print(cir_stats, row.names = FALSE)
+# Evolution of the cross-path distribution over time (shows mean reversion)
+infl_by_year <- data.frame(
+  year   = rep(1:n_years_total, each = N_MC),
+  age    = rep(current_age + 1:n_years_total, each = N_MC),
+  value  = as.numeric(infl_array) # columns stack row-major so this lines up
+)
+# Summary percentiles by year for a ribbon plot
+infl_ribbon <- infl_by_year %>%
+  group_by(age) %>%
+  summarize(
+    p05    = quantile(value, 0.05, names = FALSE),
+    p25    = quantile(value, 0.25, names = FALSE),
+    median = median(value),
+    p75    = quantile(value, 0.75, names = FALSE),
+    p95    = quantile(value, 0.95, names = FALSE),
+    .groups = "drop"
+  )
+
+p_infl_hist <- ggplot(data.frame(x = inflation_flat), aes(x = x * 100)) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.75, color = "white", linewidth = 0.1) +
+  geom_vline(xintercept = cir_theta * 100, linetype = "dashed", color = "firebrick") +
+  annotate("text", x = cir_theta * 100, y = Inf,
+           label = sprintf("theta = %.1f%%", cir_theta * 100),
+           hjust = -0.15, vjust = 1.5, color = "firebrick", size = 3.5) +
+  labs(title = "CIR Inflation - Holistic Distribution",
+       subtitle = "Pooled over all paths and all years",
+       x = "Inflation rate (%)", y = "Count") +
+  theme_minimal(base_size = 12)
+
+p_infl_ribbon <- ggplot(infl_ribbon, aes(x = age)) +
+  geom_ribbon(aes(ymin = p05 * 100, ymax = p95 * 100), fill = "steelblue", alpha = 0.2) +
+  geom_ribbon(aes(ymin = p25 * 100, ymax = p75 * 100), fill = "steelblue", alpha = 0.4) +
+  geom_line(aes(y = median * 100), color = "steelblue", linewidth = 1) +
+  geom_hline(yintercept = cir_theta * 100, linetype = "dashed", color = "firebrick") +
+  labs(title = "CIR Inflation - Granular (cross-path distribution by year)",
+       subtitle = "Ribbons: p25-p75 (dark), p05-p95 (light). Line = median. Dashed = theta.",
+       x = "Age", y = "Inflation rate (%)") +
+  theme_minimal(base_size = 12)
+
+print(p_infl_hist); print(p_infl_ribbon)
+```
+
+### Mortality / death-age distribution
+
+The mortality table drives when each simulation path terminates. Shown as both a PDF and as the empirical histogram of sampled death ages across the `N_MC` paths.
+
+```{r dist_mortality, fig.width=11, fig.height=5}
+mortality_stats <- data.frame(
+  Metric = c("Current age", "Retirement age", "Median death age",
+             "Mean death age", "p05 death age", "p95 death age",
+             "Max age in table", "Sampled mean", "Sampled SD"),
+  Value = c(
+    current_age,
+    retirement_age,
+    round(mc_mort$median_death_age, 1),
+    round(mc_mort$expected_death_age, 1),
+    quantile(death_ages, 0.05, names = FALSE),
+    quantile(death_ages, 0.95, names = FALSE),
+    max(mort_table$age),
+    round(mean(death_ages), 2),
+    round(sd(death_ages), 2)
+  )
+)
+print(mortality_stats, row.names = FALSE)
+
+p_mort_pdf <- ggplot(mort_table, aes(x = age, y = death_prob)) +
+  geom_col(fill = "firebrick", alpha = 0.8) +
+  geom_vline(xintercept = retirement_age, linetype = "dotted", color = "steelblue") +
+  geom_vline(xintercept = mc_mort$median_death_age, linetype = "dashed", color = "grey20") +
+  labs(title = "Mortality PDF (from input table)",
+       subtitle = sprintf("Median death age: %.1f", mc_mort$median_death_age),
+       x = "Age", y = "P(death at this age)") +
+  theme_minimal(base_size = 12)
+
+p_mort_sample <- ggplot(data.frame(age = death_ages), aes(x = age)) +
+  geom_histogram(binwidth = 1, fill = "firebrick", alpha = 0.7, color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = mean(death_ages), linetype = "dashed", color = "grey20") +
+  labs(title = sprintf("Sampled death ages (N_MC = %s paths)", format(N_MC, big.mark = ",")),
+       subtitle = "Empirical draws used in the simulation",
+       x = "Age", y = "Count") +
+  theme_minimal(base_size = 12)
+
+print(p_mort_pdf); print(p_mort_sample)
+```
+
+In the future, it may be wise to smooth the empirical CDF before the simulation. 
+
+## Output Distributions
+
+### Portfolio annual returns under the optimized glide path
+
+The glide path converts the per-asset return distributions into a single portfolio return each year. This is the "what the retiree actually experiences" distribution: the dot product of the optimized weights at each age with the per-asset nominal returns, then deflated by realized CIR inflation to real. Pooled over all paths and years. Shape differs from the per-asset distributions because diversification compresses the tails and shifts the mean, and inflation deflation widens the left tail in paths where realized inflation ran hot.
+
+```{r dist_portfolio_returns, fig.width=11, fig.height=5}
+# Build per-path per-year real portfolio returns under optimized weights
+# Nominal portfolio return deflated by realized CIR inflation to stay consistent with the real-terms framing of the rest of the sim.
+W_opt_dist <- result$best_weights
+port_returns_dist <- matrix(NA_real_, nrow = N_MC, ncol = n_years_total)
+for (t in seq_len(n_years_total)){
+  port_r_nom <- as.numeric(ret_array[, t, ] %*% W_opt_dist[t, ])
+  port_returns_dist[, t] <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+}
+
+port_returns_flat <- as.numeric(port_returns_dist)
+
+port_stats <- data.frame(
+  Metric = c("Count", "Mean", "SD", "Median", "p05", "p25", "p75", "p95",
+             "Skewness", "Kurtosis", "Min", "Max"),
+  Value = c(
+    format(length(port_returns_flat), big.mark = ","),
+    sprintf("%.3f%%", mean(port_returns_flat) * 100),
+    sprintf("%.3f%%", sd(port_returns_flat) * 100),
+    sprintf("%.3f%%", median(port_returns_flat) * 100),
+    sprintf("%.3f%%", quantile(port_returns_flat, 0.05, names = FALSE) * 100),
+    sprintf("%.3f%%", quantile(port_returns_flat, 0.25, names = FALSE) * 100),
+    sprintf("%.3f%%", quantile(port_returns_flat, 0.75, names = FALSE) * 100),
+    sprintf("%.3f%%", quantile(port_returns_flat, 0.95, names = FALSE) * 100),
+    sprintf("%+.3f", mean(((port_returns_flat - mean(port_returns_flat)) / sd(port_returns_flat))^3)),
+    sprintf("%.2f", mean(((port_returns_flat - mean(port_returns_flat)) / sd(port_returns_flat))^4)),
+    sprintf("%.3f%%", min(port_returns_flat) * 100),
+    sprintf("%.3f%%", max(port_returns_flat) * 100)
+  )
+)
+
+print(port_stats, row.names = FALSE)
+
+ggplot(data.frame(r = port_returns_flat), aes(x = r * 100)) +
+  geom_histogram(bins = 100, fill = "steelblue", alpha = 0.8, color = "white", linewidth = 0.1) +
+  geom_vline(xintercept = mean(port_returns_flat) * 100, linetype = "dashed", color = "firebrick") +
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey40", linewidth = 0.4) +
+  labs(title = "Portfolio Annual Return Distribution (holistic)",
+       subtitle = sprintf("Pooled across %s paths x %d years. Dashed = mean (%.2f%%).",
+                          format(N_MC, big.mark = ","), n_years_total,
+                          mean(port_returns_flat) * 100),
+       x = "Annual portfolio return (%)", y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+### Portfolio return distribution by age
+
+Same data, but sliced by age. This shows how the return distribution shape changes over the lifespan as the glide path re-balances. Early pre-retirement distributions should be wider (equity-heavy), while early-retirement distributions narrower (if the optimizer de-risks) or wider again (if the optimizer re-equitizes for bequest).
+
+```{r dist_portfolio_by_age, fig.width=11, fig.height=5}
+port_by_age <- data.frame(
+  age   = rep(current_age + 1:n_years_total, each = N_MC),
+  value = as.numeric(port_returns_dist)
+) %>%
+  group_by(age) %>%
+  summarize(
+    p05    = quantile(value, 0.05, names = FALSE),
+    p25    = quantile(value, 0.25, names = FALSE),
+    median = median(value),
+    p75    = quantile(value, 0.75, names = FALSE),
+    p95    = quantile(value, 0.95, names = FALSE),
+    sd     = sd(value),
+    .groups = "drop"
+  )
+
+ggplot(port_by_age, aes(x = age)) +
+  geom_ribbon(aes(ymin = p05 * 100, ymax = p95 * 100), fill = "steelblue", alpha = 0.2) +
+  geom_ribbon(aes(ymin = p25 * 100, ymax = p75 * 100), fill = "steelblue", alpha = 0.4) +
+  geom_line(aes(y = median * 100), color = "steelblue", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey40", linewidth = 0.4) +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey30") +
+  annotate("text", x = retirement_age + 0.5, y = max(port_by_age$p95 * 100) * 0.95,
+           label = sprintf("Retire at %d", retirement_age), hjust = 0, size = 3.5) +
+  labs(title = "Portfolio Return Distribution by Age (granular)",
+       subtitle = "Ribbons: p25-p75 (dark), p05-p95 (light). Reveals how glide path rebalancing shifts risk.",
+       x = "Age", y = "Annual portfolio return (%)") +
+  theme_minimal(base_size = 12)
+```
+
+### Terminal wealth distribution
+
+The full distribution of wealth at death across all `N_MC` paths. The scalar summaries (median, P(bequest)) live on this distribution. Heavy right tail reflects equity compounding over decades; ruined paths sit at zero.
+
+```{r dist_terminal_wealth, fig.width=11, fig.height=5}
+# Recover the terminal wealth vector from the optimized beta (re-run fitness)
+tw_result <- fitness_fn(result$best_beta)
+# fitness_fn doesn't return full terminal wealth vector, so recompute directly
+W_tw <- bernstein_weight_paths(result$best_beta)
+wealth_tw          <- rep(current_savings, N_MC)
+income_tw          <- rep(current_income, N_MC)
+ruined_tw          <- rep(FALSE, N_MC)
+terminal_wealth_tw <- rep(0.0, N_MC)
+da_tw              <- death_ages
+for (t in seq_len(n_years_total)){
+  age    <- current_age + t
+  active <- (da_tw >= age) & !ruined_tw
+  if (!any(active)) break
+  if (age <= retirement_age){
+    wealth_tw[active] <- wealth_tw[active] + income_tw[active] * savings_rate
+  }
+  port_r_nom  <- as.numeric(ret_array[, t, ] %*% W_tw[t, ])
+  port_r_real <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+  wealth_tw[active] <- wealth_tw[active] * (1 + port_r_real[active])
+  if (age > retirement_age){
+    ss_gross <- ifelse(age >= ss_start_age, ss_benefit, 0)
+    ss_net   <- ss_gross * (1 - ss_taxable_frac * retirement_tax_rate)
+    net_need <- pmax(annual_spending - ss_net, 0)
+    needed   <- net_need / (1 - retirement_tax_rate)
+    wealth_tw[active] <- wealth_tw[active] - needed
+    new_ruin <- active & (wealth_tw <= 0)
+    ruined_tw[new_ruin] <- TRUE
+    wealth_tw[ruined_tw] <- 0
+  }
+  if (age <= retirement_age){
+    income_tw[active] <- income_tw[active] * (1 + real_income_growth)
+  }
+  dying <- (da_tw == age) & !ruined_tw
+  terminal_wealth_tw[dying] <- wealth_tw[dying]
+  terminal_wealth_tw[da_tw == age & ruined_tw] <- 0
+}
+
+tw_nonruined <- terminal_wealth_tw[!ruined_tw & da_tw > retirement_age]
+tw_all       <- terminal_wealth_tw[da_tw > retirement_age]
+
+tw_stats <- data.frame(
+  Metric = c("N paths (retired sample)", "N ruined", "P(ruin)", "P(bequest >= target)",
+             "Mean TW (all)", "Mean TW (survived)", "Median TW (all)", "Median TW (survived)",
+             "p05 TW (survived)", "p95 TW (survived)", "Max TW"),
+  Value = c(
+    format(length(tw_all), big.mark = ","),
+    format(sum(ruined_tw[da_tw > retirement_age]), big.mark = ","),
+    sprintf("%.3f%%", mean(ruined_tw[da_tw > retirement_age]) * 100),
+    sprintf("%.3f%%", mean(tw_all >= bequest_target) * 100),
+    sprintf("$%s", format(round(mean(tw_all)), big.mark = ",")),
+    sprintf("$%s", format(round(mean(tw_nonruined)), big.mark = ",")),
+    sprintf("$%s", format(round(median(tw_all)), big.mark = ",")),
+    sprintf("$%s", format(round(median(tw_nonruined)), big.mark = ",")),
+    sprintf("$%s", format(round(quantile(tw_nonruined, 0.05, names = FALSE)), big.mark = ",")),
+    sprintf("$%s", format(round(quantile(tw_nonruined, 0.95, names = FALSE)), big.mark = ",")),
+    sprintf("$%s", format(round(max(tw_all)), big.mark = ","))
+  )
+)
+
+print(tw_stats, row.names = FALSE)
+# Plot: log-scale histogram for the survived-path distribution (heavy right tail)
+ggplot(data.frame(tw = tw_nonruined), aes(x = tw)) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.8, color = "white", linewidth = 0.1) +
+  geom_vline(xintercept = bequest_target, linetype = "dashed", color = "firebrick") +
+  geom_vline(xintercept = median(tw_nonruined), linetype = "dashed", color = "grey20") +
+  annotate("text", x = bequest_target, y = Inf,
+           label = sprintf("Bequest target\n$%s", format(bequest_target, big.mark = ",")),
+           hjust = -0.1, vjust = 1.5, color = "firebrick", size = 3.2) +
+  scale_x_continuous(labels = label_dollar(scale = 1e-6, suffix = "M"),
+                     trans = "log10") +
+  labs(title = "Terminal Wealth Distribution (survived paths only, log scale)",
+       subtitle = sprintf("%s non-ruined paths. Median = $%s.",
+                          format(length(tw_nonruined), big.mark = ","),
+                          format(round(median(tw_nonruined)), big.mark = ",")),
+       x = "Terminal wealth ($, log scale)", y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+### Age of ruin
+
+For the subset of paths that went bust, at what age did wealth hit zero? This is a different question than "what fraction go bust", as it reveals whether ruin tends to happen early in retirement (the "bad sequence-of-returns" danger zone) or late (exhaustion after decades of withdrawals).
+
+```{r dist_age_of_ruin, fig.width=11, fig.height=5}
+# Find age at which each ruined path first hit zero
+W_r <- bernstein_weight_paths(result$best_beta)
+wealth_r   <- rep(current_savings, N_MC)
+income_r   <- rep(current_income, N_MC)
+ruined_r   <- rep(FALSE, N_MC)
+ruin_age   <- rep(NA_integer_, N_MC)
+da_r       <- death_ages
+
+for (t in seq_len(n_years_total)){
+  age    <- current_age + t
+  active <- (da_r >= age) & !ruined_r
+  if (!any(active)) break
+  if (age <= retirement_age){
+    wealth_r[active] <- wealth_r[active] + income_r[active] * savings_rate
+  }
+  port_r_nom  <- as.numeric(ret_array[, t, ] %*% W_r[t, ])
+  port_r_real <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+  wealth_r[active] <- wealth_r[active] * (1 + port_r_real[active])
+  if (age > retirement_age){
+    ss_gross <- ifelse(age >= ss_start_age, ss_benefit, 0)
+    ss_net   <- ss_gross * (1 - ss_taxable_frac * retirement_tax_rate)
+    net_need <- pmax(annual_spending - ss_net, 0)
+    needed   <- net_need / (1 - retirement_tax_rate)
+    wealth_r[active] <- wealth_r[active] - needed
+    new_ruin <- active & (wealth_r <= 0)
+    ruin_age[new_ruin] <- age
+    ruined_r[new_ruin] <- TRUE
+    wealth_r[ruined_r] <- 0
+  }
+  if (age <= retirement_age){
+    income_r[active] <- income_r[active] * (1 + real_income_growth)
+  }
+}
+
+ruin_ages <- ruin_age[!is.na(ruin_age)]
+
+if (length(ruin_ages) > 0){
+  ruin_stats <- data.frame(
+    Metric = c("N ruined paths", "Earliest ruin age", "Median ruin age",
+               "Mean ruin age", "p25 ruin age", "p75 ruin age", "Latest ruin age"),
+    Value = c(
+      format(length(ruin_ages), big.mark = ","),
+      min(ruin_ages),
+      median(ruin_ages),
+      round(mean(ruin_ages), 1),
+      quantile(ruin_ages, 0.25, names = FALSE),
+      quantile(ruin_ages, 0.75, names = FALSE),
+      max(ruin_ages)
+    )
+  )
+
+  print(ruin_stats, row.names = FALSE)
+
+  ggplot(data.frame(age = ruin_ages), aes(x = age)) +
+    geom_histogram(binwidth = 1, fill = "firebrick", alpha = 0.75, color = "white", linewidth = 0.2) +
+    geom_vline(xintercept = median(ruin_ages), linetype = "dashed", color = "grey20") +
+    labs(title = "Age at Ruin (ruined paths only)",
+         subtitle = sprintf("%s paths went bust. Median ruin age = %d.",
+                            format(length(ruin_ages), big.mark = ","),
+                            median(ruin_ages)),
+         x = "Age at which wealth first hit zero", y = "Count") +
+    theme_minimal(base_size = 12)
+} else {
+  cat("=== Age-of-ruin distribution ===\n\nNo ruined paths to analyze: P(ruin) is effectively zero.\n")
+  ggplot() + theme_void() +
+    labs(title = "No ruined paths to display",
+         subtitle = "The optimized strategy produced zero ruin in this sample.")
+}
+```
+
+### What the distributions reveal
+
+The headline numbers are what a retiree acts on, but the shapes matter too. A median terminal wealth of `$`1.5M sounds great, but if the 5th percentile is `$`50k the retiree is one bad decade from catastrophe regardless of the median. A low P(ruin) of 3% sounds comfortable, but if those 3% tend to ruin at age 72 it is a very different story than ruin at age 95; the former leaves 20+ years of no money, the latter is almost a non-event. Similarly, the portfolio-return distribution by age reveals whether the glide path actually is doing what the optimizer thinks it is: if late-life equity exposure re-appears in the weights, the p05-p95 band should widen again toward end of life, visibly re-introducing downside risk in service of bequest upside.
+
+The input verification matters too. If the asset-return means or inflation mean drift meaningfully from their calibration targets, the LHS or CIR implementation has a bug and every downstream number is suspect. The mortality histogram confirms the sampling step isn't over- or under-weighting specific ages.
+
+# Diagnostics
+
+The following plots track the internal state of the CMA-ES optimizer over the course of the run. They are useful for verifying that the algorithm converged smoothly and did not terminate too soon. 
+
+## Convergence
+
+This plot shows three traces of P(ruin) over generations: the best candidate in each generation, the mean across all candidates in each generation, and the best-ever value seen up to that point. The best-ever trace should decrease monotonically. The gap between the generation mean and the generation best reflects the diversity of the population. If the algorithm converges, then all traces become indistinguishable, which is indeed the case. 
+
+```{r convergence, fig.height=6}
+ggplot(result$history, aes(x = gen)) +
+  geom_line(aes(y = best_ruin * 100,      color = "Gen best P(ruin)"), linewidth = 0.8) +
+  geom_line(aes(y = mean_ruin * 100,      color = "Gen mean P(ruin)"), linewidth = 0.5, alpha = 0.5) +
+  geom_line(aes(y = best_ever_ruin * 100, color = "Best ever P(ruin)"), linewidth = 1.2) +
+  scale_color_manual(values = c("Gen best P(ruin)"  = "steelblue",
+                                 "Gen mean P(ruin)"  = "grey60",
+                                 "Best ever P(ruin)" = "firebrick")) +
+  labs(title = "CMA-ES Convergence",
+       subtitle = sprintf("Final P(ruin) = %.2f%%  |  %s fixed LHS paths throughout",
+                          result$best_ruin * 100, format(N_MC, big.mark=",")),
+       x = "Generation", y = "P(Ruin) %", color = "") +
+  theme_minimal(base_size = 14)
+```
+
+## Step Size (Sigma) Evolution
+
+Sigma is the global step size of the CMA-ES search distribution and controls how far from the current mean the algorithm samples new candidates. Early in the run sigma should remain relatively large as the algorithm explores, and as it hones in on a solution sigma should decrease. A sharp collapse of sigma toward zero is a strong signal that the algorithm has converged to a tight region of the search space and further generations would not produce meaningful improvement. Because we are working in control-point space (where each dimension is in [0,1]), the scale of sigma is directly interpretable. A sigma of 0.01 means the algorithm is exploring variations of roughly +/- 1% in each control point.
+
+```{r sigma_plot, fig.height=4}
+ggplot(result$history, aes(x = gen, y = sigma)) +
+  geom_line(color = "purple4", linewidth = 0.8) +
+  labs(title = "Step Size (Sigma) in Control-Point Space",
+       subtitle = "Collapse indicates tight convergence on the optimal allocation shape",
+       x = "Generation", y = "Sigma") +
+  theme_minimal(base_size = 14)
+```
+
+## Path Roughness
+
+Roughness is defined as the sum of squared year-over-year changes across all asset weight curves. It is not part of the fitness function and the optimizer does not try to minimize it. It is tracked purely as a sanity check to verify that the Bernstein polynomial parameterization is doing its job of keeping the paths smooth. With Bernstein polynomials, roughness should be low and stable from generation 1 because the polynomial basis makes jaggedness structurally impossible.
+
+```{r roughness_plot, fig.height=4}
+ggplot(result$history, aes(x = gen, y = roughness)) +
+  geom_line(color = "darkgreen", linewidth = 0.8) +
+  labs(title = "Path Roughness Over Generations",
+       subtitle = sprintf("Final roughness: %.4f", tail(result$history$roughness, 1)),
+       x = "Generation", y = "Sum of squared diffs (all assets)") +
+  theme_minimal(base_size = 14)
+```
+
+## Summary Statistics
+
+This final block prints the full configuration and results in plain text for easy reference and reproducibility.
+
+```{r summary_table}
+config_data <- tibble(
+  Parameter = c(
+    "Algorithm",
+    "Parameterization",
+    "Asset classes",
+    "Control points per asset (N_CPTS)",
+    "Total optimization dimensions",
+    "MC sampling",
+    "MC paths (fixed)",
+    "Population (lambda)",
+    "Parallel cores"
+  ),
+  Value = c(
+    "sep-CMA-ES (diagonal covariance)",
+    "Bernstein polynomial (direct basis via dbinom, precomputed)",
+    sprintf("%d (%s)", N_ASSETS, paste(asset_names, collapse = ", ")),
+    as.character(N_CPTS),
+    sprintf("%d  (= %d assets * %d Control Points)", N_DIMS_TOTAL, N_ASSETS, N_CPTS),
+    "Latin Hypercube Sampling",
+    format(N_MC, big.mark = ","),
+    as.character(CMAES_POP_SIZE),
+    as.character(N_CORES)
+  )
+)
+
+results_data <- tibble(
+  Parameter = c(
+    "Generations run",
+    "Final sigma (control-point space)",
+    "Runtime (min)",
+    "P(Ruin)",
+    "P(Bequest >= target)",
+    "Median terminal wealth",
+    "Path roughness (diagnostic)"
+  ),
+  Value = c(
+    as.character(result$n_gens),
+    sprintf("%.6f", tail(result$history$sigma, 1)),
+    sprintf("%.1f", result$elapsed_min),
+    sprintf("%.2f%%", result$best_ruin * 100),
+    sprintf("%.1f%%",  result$best_details$p_bequest * 100),
+    sprintf("$%s", format(round(result$best_details$median_wealth), big.mark = ",")),
+    sprintf("%.4f", result$best_details$roughness)
+  )
+)
+
+cat("=== Configuration ===\n")
+for (i in seq_len(nrow(config_data))){
+  cat(sprintf("  %-35s %s\n", config_data$Parameter[i], config_data$Value[i]))
+}
+
+cat("\n=== Optimization Results ===\n")
+for (i in seq_len(nrow(results_data))){
+  cat(sprintf("  %-35s %s\n", results_data$Parameter[i], results_data$Value[i]))
+}
+```
+
+# Sensitivity Analysis (Tornado Chart)
+
+The P(ruin) and P(bequest) numbers above are conditional on a specific set of personal assumptions. Some of these are measured well (current savings, current income from a paystub), some are projected with large error (real income growth over 35 years, the effective retirement tax rate), and some are under the retiree's partial control (spending, savings rate, SS claiming age). Before taking the optimized glide path too literally, it is worth asking how sensitive the result is to each assumption.
+
+A tornado chart answers this by perturbing each assumption one at a time and re-evaluating the *already-optimized* Bernstein beta on the perturbed world. The same pre-generated `ret_array` and `death_ages` are used throughout, so differences reflect the assumption change alone and not Monte Carlo noise. Re-evaluating rather than re-optimizing is deliberate: we are measuring the fragility of the current strategy to assumption shifts, which is what a real decision-maker faces.
+
+Below we run two tornadoes. The first uses a symmetric +/-10% perturbation on every parameter, which makes the bars directly comparable in terms of elasticity: the bar width is the strategy's sensitivity per 10% of parameter change. The second uses calibrated realistic uncertainty bands that reflect how well each parameter can actually be known. Real income growth, for example, could plausibly be off by a factor of 2 over a 35-year horizon, while current savings is known to the dollar. The second tornado reflects the more honest question: given what one actually know about one's inputs, how much should one trust the P(ruin) number?
+
+```{r tornado_eval_fn}
+# Tornado evaluator: mirrors fitness_fn (incl. inflation + RMD) but with parameter overrides
+eval_with_overrides <- function(beta_flat, overrides = list()){
+  p <- list(
+    current_savings      = current_savings,
+    current_income       = current_income,
+    savings_rate         = savings_rate,
+    real_income_growth   = real_income_growth,
+    annual_spending      = annual_spending,
+    ss_benefit           = ss_benefit,
+    ss_start_age         = ss_start_age,
+    bequest_target       = bequest_target,
+    retirement_tax_rate  = retirement_tax_rate,
+    ss_taxable_frac      = ss_taxable_frac
+  )
+  p[names(overrides)] <- overrides
+
+  W <- bernstein_weight_paths(beta_flat)
+  wealth          <- rep(p$current_savings, N_MC)
+  income          <- rep(p$current_income,  N_MC)
+  ruined          <- rep(FALSE, N_MC)
+  terminal_wealth <- rep(0.0, N_MC)
+  da              <- death_ages
+
+  for (t in seq_len(n_years_total)){
+    age    <- current_age + t
+    active <- (da >= age) & !ruined
+    if (!any(active)) break
+
+    if (age <= retirement_age){
+      wealth[active] <- wealth[active] + income[active] * p$savings_rate
+    }
+    # Nominal return, deflated by realized CIR inflation
+    port_r_nom  <- as.numeric(ret_array[, t, ] %*% W[t, ])
+    port_r_real <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+    wealth[active] <- wealth[active] * (1 + port_r_real[active])
+
+    if (age > retirement_age){
+      ss_gross <- ifelse(age >= p$ss_start_age, p$ss_benefit, 0)
+      ss_net   <- ss_gross * (1 - p$ss_taxable_frac * p$retirement_tax_rate)
+      net_need <- pmax(p$annual_spending - ss_net, 0)
+      needed   <- net_need / (1 - p$retirement_tax_rate)
+      wealth[active] <- wealth[active] - needed
+      new_ruin <- active & (wealth <= 0)
+      ruined[new_ruin] <- TRUE
+      wealth[ruined]   <- 0
+    }
+
+    if (age <= retirement_age){
+      income[active] <- income[active] * (1 + p$real_income_growth)
+    }
+
+    dying <- (da == age) & !ruined
+    terminal_wealth[dying] <- wealth[dying]
+    terminal_wealth[da == age & ruined] <- 0
+  }
+
+  retired   <- da > retirement_age
+  p_ruin    <- if (sum(retired) > 0) mean(ruined[retired]) else 1.0
+  p_bequest <- mean(terminal_wealth >= p$bequest_target)
+  list(p_ruin = p_ruin, p_bequest = p_bequest)
+}
+
+# Baseline (should match result$best_ruin exactly)
+baseline <- eval_with_overrides(result$best_beta)
+cat(sprintf("Baseline P(ruin)    = %.3f%%  (optimizer reported: %.3f%%)\n",
+            baseline$p_ruin * 100, result$best_ruin * 100))
+cat(sprintf("Baseline P(bequest) = %.3f%%\n", baseline$p_bequest * 100))
+```
+
+## Tornado 1: Symmetric +/-10% Elasticity
+
+Every parameter perturbed by the same relative amount. Makes bars directly comparable. Integer-valued parameters (SS start age, RMD start age) use +/-2 years, the realistic decision/legislative window.
+
+```{r tornado_run_sym}
+# Helper to format numeric parameter values with an appropriate unit
+fmt_val <- function(x, kind){
+  switch(kind,
+    dollar = sprintf("$%s", format(round(x), big.mark = ",")),
+    pct    = sprintf("%.1f%%", x * 100),
+    year   = sprintf("age %d", as.integer(x)),
+    yrs    = sprintf("%.1f yrs", x),
+    as.character(x)
+  )
+}
+
+params_sym <- list(
+  list(name = "Annual spending",       key = "annual_spending",     kind = "dollar", base = annual_spending,     lo = 0.90 * annual_spending,     hi = 1.10 * annual_spending),
+  list(name = "Current savings",       key = "current_savings",     kind = "dollar", base = current_savings,     lo = 0.90 * current_savings,     hi = 1.10 * current_savings),
+  list(name = "Current income",        key = "current_income",      kind = "dollar", base = current_income,      lo = 0.90 * current_income,      hi = 1.10 * current_income),
+  list(name = "Savings rate",          key = "savings_rate",        kind = "pct",    base = savings_rate,        lo = 0.90 * savings_rate,        hi = 1.10 * savings_rate),
+  list(name = "Real income growth",    key = "real_income_growth",  kind = "pct",    base = real_income_growth,  lo = 0.90 * real_income_growth,  hi = 1.10 * real_income_growth),
+  list(name = "SS annual benefit",     key = "ss_benefit",          kind = "dollar", base = ss_benefit,          lo = 0.90 * ss_benefit,          hi = 1.10 * ss_benefit),
+  list(name = "SS start age",          key = "ss_start_age",        kind = "year",   base = ss_start_age,        lo = ss_start_age - 2,           hi = ss_start_age + 2),
+  list(name = "Retirement tax rate",   key = "retirement_tax_rate", kind = "pct",    base = retirement_tax_rate, lo = 0.90 * retirement_tax_rate, hi = 1.10 * retirement_tax_rate)
+)
+
+run_tornado <- function(plist){
+  do.call(rbind, lapply(plist, function(p){
+    lo_res <- eval_with_overrides(result$best_beta, setNames(list(p$lo), p$key))
+    hi_res <- eval_with_overrides(result$best_beta, setNames(list(p$hi), p$key))
+    data.frame(
+      parameter  = p$name,
+      kind       = p$kind,
+      base_val   = p$base,
+      lo_val     = p$lo,
+      hi_val     = p$hi,
+      ruin_lo    = lo_res$p_ruin,
+      ruin_hi    = hi_res$p_ruin,
+      bequest_lo = lo_res$p_bequest,
+      bequest_hi = hi_res$p_bequest,
+      stringsAsFactors = FALSE
+    )
+  })) %>%
+    mutate(
+      ruin_swing = abs(ruin_hi - ruin_lo),
+      lo_delta   = (ruin_lo - baseline$p_ruin) * 100,
+      hi_delta   = (ruin_hi - baseline$p_ruin) * 100,
+      lo_abs     = ruin_lo * 100,
+      hi_abs     = ruin_hi * 100,
+      value_ctx  = mapply(function(b, l, h, k) sprintf("base %s  |  %s / %s",
+                                                       fmt_val(b, k), fmt_val(l, k), fmt_val(h, k)),
+                          base_val, lo_val, hi_val, kind)
+    ) %>%
+    arrange(ruin_swing) %>%
+    mutate(parameter = factor(parameter, levels = parameter))
+}
+
+tornado_sym <- run_tornado(params_sym)
+
+# Print explicit table: absolute and delta P(ruin) for each perturbation
+cat("\n=== Tornado 1: Symmetric +/-10% perturbations ===\n")
+cat(sprintf("Baseline P(ruin) = %.3f%%\n\n", baseline$p_ruin * 100))
+print_df <- tornado_sym %>%
+  arrange(desc(ruin_swing)) %>%
+  transmute(
+    Parameter          = as.character(parameter),
+    `Base | Lo / Hi`   = value_ctx,
+    `P(ruin) lo`       = sprintf("%.3f%% (%+.3fpp)", lo_abs, lo_delta),
+    `P(ruin) hi`       = sprintf("%.3f%% (%+.3fpp)", hi_abs, hi_delta),
+    `Swing (pp)`       = sprintf("%.3f", ruin_swing * 100)
+  )
+print(print_df, row.names = FALSE)
+```
+
+```{r tornado_plot_sym, fig.width=11, fig.height=6.5}
+# Enriched tornado plot: show baseline as solid line, absolute P(ruin) at each end
+ggplot(tornado_sym, aes(y = parameter)) +
+  geom_segment(aes(x = lo_abs, xend = hi_abs, yend = parameter),
+               linewidth = 8, color = "steelblue", alpha = 0.75) +
+  geom_vline(xintercept = baseline$p_ruin * 100, linetype = "solid",
+             color = "grey20", linewidth = 0.6) +
+  geom_text(aes(x = lo_abs,
+                label = sprintf("%.2f%%\n(%+.2fpp)", lo_abs, lo_delta)),
+            hjust = 1.1, size = 2.8, color = "grey15", lineheight = 0.9) +
+  geom_text(aes(x = hi_abs,
+                label = sprintf("%.2f%%\n(%+.2fpp)", hi_abs, hi_delta)),
+            hjust = -0.1, size = 2.8, color = "grey15", lineheight = 0.9) +
+  annotate("text", x = baseline$p_ruin * 100,
+           y = length(levels(tornado_sym$parameter)) + 0.3,
+           label = sprintf("baseline = %.2f%%", baseline$p_ruin * 100),
+           size = 3.3, color = "grey20", hjust = 0.5) +
+  labs(title = "Tornado 1: \u0394 P(ruin) under symmetric +/-10% perturbations",
+       subtitle = sprintf("Each bar spans lo (-10%%) to hi (+10%%). Vertical line = baseline P(ruin) = %.2f%%.",
+                          baseline$p_ruin * 100),
+       x = "P(ruin) (%)  (absolute on axis, delta in parentheses)", y = "",
+       caption = "Parameters sorted by swing magnitude. Wider = more sensitive.") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        plot.margin = margin(12, 40, 12, 40))
+```
+
+## Tornado 2: Calibrated Realistic Uncertainty Bands
+
+Not every parameter is equally uncertain. The bands below reflect order-of-magnitude "how well do I actually know this" estimates. This reveals that the P(ruin) sensitivity rankings change meaningfully once you account for realistic uncertainty: a parameter that is elastic but well-known moves down the chart; a parameter that is inelastic but highly uncertain can move up.
+
+Uncertainty band rationale:
+
+- **Current savings** (+/-1%): known to the dollar from account statements; the only uncertainty is timing and valuation noise.
+- **Current income** (+/-5%): the paystub is exact for this year, but income can move with promotions/job changes.
+- **Savings rate** (+/-20%): under personal control but subject to budget shocks (home purchase, kids, medical), so a 2-3pp absolute band is realistic.
+- **Annual spending** (+/-20%): retirees often underestimate their actual spending; the Society of Actuaries has published retrospective analyses showing realized spending diverges from budgeted by 15-25%.
+- **Real income growth** (+/-50%): 35-year projection errors compound; could plausibly be 0.75% or 2.25% rather than the 1.5% baseline.
+- **SS annual benefit** (-25% / +5%): asymmetric because the SSA trustee reports indicate legislative-gap scenarios could cut benefits 20-25% in the 2030s absent action; upside is capped by the benefit formula.
+- **SS start age** (+/-5 years): spans the full claim-at-62 to delay-to-70 decision.
+- **Retirement tax rate** (+/-30%): legislative risk on federal brackets, potential state moves, filing-status changes post-spouse's death.
+
+```{r tornado_run_calibrated}
+params_calib <- list(
+  list(name = "Annual spending (+/-20%)",        key = "annual_spending",     kind = "dollar", base = annual_spending,     lo = 0.80 * annual_spending,     hi = 1.20 * annual_spending),
+  list(name = "Current savings (+/-1%)",         key = "current_savings",     kind = "dollar", base = current_savings,     lo = 0.99 * current_savings,     hi = 1.01 * current_savings),
+  list(name = "Current income (+/-5%)",          key = "current_income",      kind = "dollar", base = current_income,      lo = 0.95 * current_income,      hi = 1.05 * current_income),
+  list(name = "Savings rate (+/-20%)",           key = "savings_rate",        kind = "pct",    base = savings_rate,        lo = 0.80 * savings_rate,        hi = 1.20 * savings_rate),
+  list(name = "Real income growth (+/-50%)",     key = "real_income_growth",  kind = "pct",    base = real_income_growth,  lo = 0.50 * real_income_growth,  hi = 1.50 * real_income_growth),
+  list(name = "SS benefit (-25% / +5%)",         key = "ss_benefit",          kind = "dollar", base = ss_benefit,          lo = 0.75 * ss_benefit,          hi = 1.05 * ss_benefit),
+  list(name = "SS start age (+/-5y)",            key = "ss_start_age",        kind = "year",   base = ss_start_age,        lo = ss_start_age - 5,           hi = ss_start_age + 3),
+  list(name = "Retirement tax rate (+/-30%)",    key = "retirement_tax_rate", kind = "pct",    base = retirement_tax_rate, lo = 0.70 * retirement_tax_rate, hi = 1.30 * retirement_tax_rate)
+)
+
+tornado_calib <- run_tornado(params_calib)
+
+cat("\n=== Tornado 2: Calibrated realistic uncertainty bands ===\n")
+cat(sprintf("Baseline P(ruin) = %.3f%%\n\n", baseline$p_ruin * 100))
+print_df_c <- tornado_calib %>%
+  arrange(desc(ruin_swing)) %>%
+  transmute(
+    Parameter          = as.character(parameter),
+    `Base | Lo / Hi`   = value_ctx,
+    `P(ruin) lo`       = sprintf("%.3f%% (%+.3fpp)", lo_abs, lo_delta),
+    `P(ruin) hi`       = sprintf("%.3f%% (%+.3fpp)", hi_abs, hi_delta),
+    `Swing (pp)`       = sprintf("%.3f", ruin_swing * 100)
+  )
+print(print_df_c, row.names = FALSE)
+```
+
+```{r tornado_plot_calib, fig.width=11, fig.height=6.5}
+ggplot(tornado_calib, aes(y = parameter)) +
+  geom_segment(aes(x = lo_abs, xend = hi_abs, yend = parameter),
+               linewidth = 8, color = "firebrick", alpha = 0.7) +
+  geom_vline(xintercept = baseline$p_ruin * 100, linetype = "solid",
+             color = "grey20", linewidth = 0.6) +
+  geom_text(aes(x = lo_abs,
+                label = sprintf("%.2f%%\n(%+.2fpp)", lo_abs, lo_delta)),
+            hjust = 1.1, size = 2.8, color = "grey15", lineheight = 0.9) +
+  geom_text(aes(x = hi_abs,
+                label = sprintf("%.2f%%\n(%+.2fpp)", hi_abs, hi_delta)),
+            hjust = -0.1, size = 2.8, color = "grey15", lineheight = 0.9) +
+  annotate("text", x = baseline$p_ruin * 100,
+           y = length(levels(tornado_calib$parameter)) + 0.3,
+           label = sprintf("baseline = %.2f%%", baseline$p_ruin * 100),
+           size = 3.3, color = "grey20", hjust = 0.5) +
+  labs(title = "Tornado 2: \u0394 P(ruin) under calibrated realistic uncertainty bands",
+       subtitle = "Asymmetric bands reflect what each parameter is actually known to. Compare ordering to Tornado 1.",
+       x = "P(ruin) (%)  (absolute on axis, delta in parentheses)", y = "",
+       caption = "Reveals which assumptions dominate real-world fragility once uncertainty is honest.") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        plot.margin = margin(12, 40, 12, 40))
+```
+
+### Bequest-probability impact
+
+P(bequest >= target) responds to the same perturbations, often in the opposite direction. A parameter that makes ruin more likely (e.g., higher spending or higher tax rate) also makes the bequest less likely, but magnitudes differ because ruin is a left-tail event and bequest is a right-tail event.
+
+```{r tornado_bequest_table}
+bequest_summary <- tornado_calib %>%
+  mutate(
+    beq_lo_delta = (bequest_lo - baseline$p_bequest) * 100,
+    beq_hi_delta = (bequest_hi - baseline$p_bequest) * 100
+  ) %>%
+  arrange(desc(abs(beq_hi_delta - beq_lo_delta))) %>%
+  transmute(
+    Parameter           = as.character(parameter),
+    `P(ruin) lo`        = sprintf("%+.2fpp", lo_delta),
+    `P(ruin) hi`        = sprintf("%+.2fpp", hi_delta),
+    `P(beq) lo`         = sprintf("%+.2fpp", beq_lo_delta),
+    `P(beq) hi`         = sprintf("%+.2fpp", beq_hi_delta)
+  )
+
+print(bequest_summary, row.names = FALSE)
+```
+
+### Interpreting the charts
+
+The symmetric tornado measures elasticity, the strategy's per-unit sensitivity to each parameter. The calibrated tornado measures realized fragility, the band of P(ruin) outcomes you should actually expect given honest uncertainty about each input. If the two tornadoes look very different in ordering, it tells you which parameters are not worth worrying to much over (elastic but well-known, so not actually a major real-world concern) and which are (even slight elasticity combined with large real uncertainty produces real swings in outcomes).
+
+The retirement tax rate is typically a silent killer: a 10% elasticity is unremarkable, but 30% realistic uncertainty compounds into a meaningful real-world band, and future rates are genuinely unknowable (legislative risk on brackets, potential state moves, filing-status changes post-spouse's death). Annual spending is typically dominant in both tornadoes because retirees both underestimate actual spending and have genuine uncertainty about future needs (healthcare especially). Current savings is usually the opposite: it moves the bar in the symmetric case, but collapses to nothing in the calibrated case because you actually know your balance.
+
+Social Security enters the calibrated tornado with an **asymmetric** band: -25% to +5%. The SSA trustee reports routinely flag that without legislative action the trust fund shortfall could reduce benefits by 20-25% starting in the mid-2030s, while upside is capped by the statutory benefit formula. The start-age band (+/-5 years) captures the full range from claiming at 62 to delaying to 70, since delayed credits permanently increase the benefit.
+
+# Portfolio Statistics by 5-Year Window
+
+The glide path changes the asset mix every year, so headline lifetime statistics obscure the fact that the retiree is effectively holding a different portfolio at 30 than at 50 or 80. Breaking the lifespan into 5-year windows reveals how the risk-return profile evolves as the Bernstein curves re-weight the portfolio. This section reports: ann. geometric return (CAGR), ann. volatility, Sharpe ratio, Sortino ratio, maximum drawdown, skewness, 5%VaR, and 5%CVaR.
+
+These are computed per Monte Carlo path within each window and then summarized across paths as the median and the 5th/95th percentiles. Computing per-path and then summarizing is deliberate: averaging returns across paths first and then computing statistics would hide the path-dependence that matters most for a retiree (the sequence-of-returns risk). The median is the "typical" experience; the 5th/95th percentiles bracket what a retiree could plausibly see. The portfolio returns used here are **real** (nominal draws from `ret_array` deflated by realized CIR inflation), so the risk-free rate for Sharpe is set to zero: the natural numeraire is real cash, which has a real arithmetic return of roughly 0.8%, close enough to zero that the distinction is cosmetic at this level of aggregation.
+
+```{r port_stats_windows, fig.width=10, fig.height=6}
+# Build per-year portfolio returns for all MC paths under the optimized weights
+W_opt <- result$best_weights  # (n_years_total x N_ASSETS), rows sum to 1
+# port_returns: (N_MC x n_years_total), real portfolio return each year for each path
+# Nominal return deflated by realized CIR inflation to stay consistent with real-terms framing.
+port_returns <- matrix(NA_real_, nrow = N_MC, ncol = n_years_total)
+for (t in seq_len(n_years_total)){
+  port_r_nom <- as.numeric(ret_array[, t, ] %*% W_opt[t, ])
+  port_returns[, t] <- (1 + port_r_nom) / (1 + infl_array[, t]) - 1
+}
+# Define 5-year windows spanning the lifespan
+window_size <- 5
+window_starts <- seq(1, n_years_total, by = window_size)
+# Drop the last window if it's a partial (keep only full 5-year blocks)
+window_starts <- window_starts[window_starts + window_size - 1 <= n_years_total]
+# Per-path window statistics
+# Returns a data frame: one row per (window, path) with all the metrics
+compute_window_stats <- function(returns_block){
+  # returns_block: N_MC x window_size matrix of annual returns
+  # Returns per-path stats; caller summarizes across paths
+  n_yrs <- ncol(returns_block)
+  # Cumulative wealth path within window (starting at 1.0)
+  wealth_path <- cbind(1, t(apply(1 + returns_block, 1, cumprod)))
+  # Annualized geometric return (CAGR)
+  terminal   <- wealth_path[, ncol(wealth_path)]
+  cagr       <- terminal^(1 / n_yrs) - 1
+  # Annualized volatility (sample SD of annual returns within the window)
+  ann_vol    <- apply(returns_block, 1, sd)
+  # Sharpe (rf = 0 in real terms)
+  sharpe     <- ifelse(ann_vol > 0, cagr / ann_vol, NA_real_)
+  # Downside deviation (semi-deviation below 0 target) and Sortino
+  downside   <- apply(returns_block, 1, function(r){
+    neg <- pmin(r, 0); sqrt(mean(neg^2))
+  })
+  sortino    <- ifelse(downside > 0, cagr / downside, NA_real_)
+  # Max drawdown within window
+  max_dd     <- apply(wealth_path, 1, function(w){
+    peak <- cummax(w); min(w / peak - 1)
+  })
+  # Skewness of annual returns (Pearson's moment coefficient)
+  skew       <- apply(returns_block, 1, function(r){
+    m <- mean(r); s <- sd(r)
+    if (s == 0) NA_real_ else mean(((r - m) / s)^3)
+  })
+  # 5%VaR and CVaR on the annual-return distribution within the window
+  # (per-path; uses the n_yrs annual returns for that path)
+  var5       <- apply(returns_block, 1, quantile, probs = 0.05, names = FALSE)
+  cvar5      <- apply(returns_block, 1, function(r){
+    thr <- quantile(r, 0.05, names = FALSE)
+    tail_r <- r[r <= thr]
+    if (length(tail_r) == 0) thr else mean(tail_r)
+  })
+  data.frame(cagr, ann_vol, sharpe, sortino, max_dd, skew, var5, cvar5)
+}
+# Summarize each window across paths (median, p5, p95) + average weights
+summarize_window <- function(stats_df, age_start, age_end, weights_block){
+  # weights_block: window_size x N_ASSETS slice of W_opt
+  avg_w <- colMeans(weights_block)
+  names(avg_w) <- asset_names
+  
+  qfun <- function(x) quantile(x, probs = c(0.05, 0.50, 0.95),
+                                names = FALSE, na.rm = TRUE)
+
+  out <- data.frame(
+    age_start = age_start,
+    age_end   = age_end,
+    label     = sprintf("%d-%d", age_start, age_end),
+    cagr_p50  = qfun(stats_df$cagr)[2],
+    cagr_p05  = qfun(stats_df$cagr)[1],
+    cagr_p95  = qfun(stats_df$cagr)[3],
+    vol_p50   = qfun(stats_df$ann_vol)[2],
+    sharpe_p50  = qfun(stats_df$sharpe)[2],
+    sortino_p50 = qfun(stats_df$sortino)[2],
+    maxdd_p50 = qfun(stats_df$max_dd)[2],
+    maxdd_p05 = qfun(stats_df$max_dd)[1],  # worst 5% of paths
+    skew_p50  = qfun(stats_df$skew)[2],
+    var5_p50  = qfun(stats_df$var5)[2],
+    cvar5_p50 = qfun(stats_df$cvar5)[2]
+  )
+  for (k in seq_along(avg_w)){
+    out[[paste0("w_", names(avg_w)[k])]] <- avg_w[k]
+  }
+  out
+}
+
+window_stats <- do.call(rbind, lapply(window_starts, function(ws){
+  we <- ws + window_size - 1
+  age_start <- current_age + ws
+  age_end   <- current_age + we
+  stats_df  <- compute_window_stats(port_returns[, ws:we, drop = FALSE])
+  summarize_window(stats_df, age_start, age_end,
+                   W_opt[ws:we, , drop = FALSE])
+}))
+# Printable summary table
+summary_tbl <- window_stats %>%
+  transmute(
+    Window        = label,
+    `CAGR (p50)`  = sprintf("%.2f%%", cagr_p50 * 100),
+    `CAGR p05/p95`= sprintf("%.2f / %.2f%%", cagr_p05 * 100, cagr_p95 * 100),
+    `Vol (p50)`   = sprintf("%.2f%%", vol_p50 * 100),
+    `Sharpe`      = sprintf("%.2f", sharpe_p50),
+    `Sortino`     = sprintf("%.2f", sortino_p50),
+    `MaxDD p50`   = sprintf("%.1f%%", maxdd_p50 * 100),
+    `MaxDD p05`   = sprintf("%.1f%%", maxdd_p05 * 100),
+    `Skew`        = sprintf("%+.2f", skew_p50),
+    `VaR 5%`      = sprintf("%.2f%%", var5_p50 * 100),
+    `CVaR 5%`     = sprintf("%.2f%%", cvar5_p50 * 100)
+  )
+
+print(summary_tbl, row.names = FALSE)
+```
+
+### Return and drawdown across windows
+
+The plot below visualizes the return and drawdown profile alongside the asset mix. The top panel shows median CAGR with the 5th-to-95th percentile band; the middle panel shows median and 5th-percentile (worst-5%-of-paths) max drawdown within each window; the bottom panel shows the average asset weights in each window as a stacked area, so the reader can see which allocation produced which risk-return profile.
+
+```{r port_stats_plot, fig.width=10, fig.height=9}
+# Long-format for the weight stack
+wt_long <- window_stats %>%
+  dplyr::select(label, starts_with("w_")) %>%
+  pivot_longer(-label, names_to = "asset", values_to = "weight") %>%
+  mutate(asset = factor(sub("^w_", "", asset), levels = asset_names))
+
+p1 <- ggplot(window_stats, aes(x = label, group = 1)) +
+  geom_ribbon(aes(ymin = cagr_p05 * 100, ymax = cagr_p95 * 100),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = cagr_p50 * 100), color = "steelblue", linewidth = 1) +
+  geom_point(aes(y = cagr_p50 * 100), color = "steelblue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "Annualized Return (CAGR) by 5-Year Window",
+       subtitle = "Line = median across MC paths; band = 5th-95th percentile",
+       x = NULL, y = "CAGR (%, real)") +
+  theme_minimal(base_size = 12)
+
+p2 <- ggplot(window_stats, aes(x = label, group = 1)) +
+  geom_line(aes(y = maxdd_p50 * 100, color = "Median (p50)"), linewidth = 1) +
+  geom_line(aes(y = maxdd_p05 * 100, color = "Worst 5% (p05)"), linewidth = 1, linetype = "dashed") +
+  geom_point(aes(y = maxdd_p50 * 100), color = "firebrick", size = 2) +
+  scale_color_manual(values = c("Median (p50)" = "firebrick",
+                                 "Worst 5% (p05)" = "grey30")) +
+  labs(title = "Max Drawdown Within Window",
+       x = NULL, y = "Max drawdown (%)", color = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+
+# show the three plots
+print(p1); print(p2)
+```
+
+# Conclusion
+
+Across the optimized glide path, the domestic-equity curve traces out a clear V-shape over the lifespan. Equity allocation is high during the accumulation years, declines into a trough around the retirement transition, and then rises again through late retirement. This is precisely the V-shaped equity pattern that Pfau and Kitces (2014) argued should reduce both the probability and severity of portfolio failure. Their argument was based on sequence-of-returns risk: the retirement portfolio is most vulnerable in the early retirement years when withdrawals meet a possibly depleted balance, and easing into equities as retirement progresses lets the portfolio benefit from any long-horizon equity premium while the withdrawal window shortens. The CMA-ES optimizer here, given no shape constraint and no knowledge of their paper, independently converges on the same qualitative shape by simply minimizing P(ruin) over a Monte Carlo of plausible market and mortality paths. The empirical agreement between their 121-path grid search and this continuous-space numerical optimization is notable: two very different methodologies, operating on different underlying return calibrations, arrive at the same non-monotone glide-path prescription. The finding supports their hypothesis that the conventional monotone-decline glide path is not optimal under the joint pressures of sequence risk and a bequest motive, and that rising late-life equity exposure is the appropriate response.
+
+The caveat that applies to both works also applies here: the result is conditional on the assumed mortality, spending, savings, tax, and return distributions. The tornado analysis quantifies that fragility, and the distribution plots show where a scalar P(ruin) or P(bequest) oversimplifies the actual retiree experience. But under any reasonable version of those assumptions, monotone-decline glide paths appear to leave something on the table relative to rising-equity alternatives
+
+
+# References
+
+Blanchett, D. M. (2007). Dynamic Allocation Strategies for Distribution Portfolios: Determining the Optimal Distribution Glide Path. *Journal of Financial Planning*, 20(12), 68–81.
+
+Hansen, N. (2016). The CMA Evolution Strategy: A Tutorial. *arXiv:1604.00772*.
+
+Lorentz, G.G. (1953). *Bernstein Polynomials.* University of Toronto Press.
+
+McKay, M. D., Beckman, R. J., & Conover, W. J. (1979). A Comparison of Three Methods for Selecting Values of Input Variables in the Analysis of Output from a Computer Code. *Technometrics*, 21(2), 239-245.
+
+Pfau, W. D., & Kitces, M. E. (2014). Reducing Retirement Risk with a Rising Equity Glide Path. *Journal of Financial Planning*, 27(1), 38–45.
+
